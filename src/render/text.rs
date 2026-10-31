@@ -27,7 +27,18 @@ use std::collections::{HashMap, HashSet};
 use std::os::raw::c_int;
 
 /// Default font for engine-side text.
-pub const DEFAULT_FONT: &str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc";
+///
+/// Only a last resort: the font profiles found on this machine (see
+/// `medium_paths` / `font_search_dirs`) are preferred, and `WA2_FONT` overrides
+/// everything. It still has to name a file that exists on the platform, so that
+/// a machine with no usable profile fails with a believable path in the error.
+pub const DEFAULT_FONT: &str = if cfg!(target_os = "macos") {
+    "/System/Library/Fonts/PingFang.ttc"
+} else if cfg!(target_os = "windows") {
+    "C:/Windows/Fonts/msyh.ttc"
+} else {
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Medium.ttc"
+};
 /// Default face index inside the .ttc.
 ///
 /// A .ttc is a collection: NotoSansCJK-Medium.ttc holds JP(0), KR(1), SC(2),
@@ -35,7 +46,10 @@ pub const DEFAULT_FONT: &str = "/usr/share/fonts/opentype/noto/NotoSansCJK-Mediu
 /// 骨/直/着, different component proportions - so the Chinese text has to ask
 /// for the SC face. `WA2_FONT` accepts `path#index` and `WA2_FONT_FACE`
 /// overrides this.
-pub const DEFAULT_FACE: i64 = 2;
+///
+/// PingFang.ttc (macOS) starts at the Simplified Chinese face, so the index
+/// above does not apply there.
+pub const DEFAULT_FACE: i64 = if cfg!(target_os = "macos") { 0 } else { 2 };
 /// Default ink gamma in permille. 1000 leaves the coverage untouched; below
 /// 1000 lifts the anti-aliased edge without the hard saturation a linear
 /// percentage gain causes. See `VectorFont::set_ink_gamma`.
@@ -1732,8 +1746,14 @@ fn medium_paths() -> &'static [(&'static str, i64)] {
     if cfg!(target_os = "windows") {
         &[("C:/Windows/Fonts/msyhbd.ttc", 0), ("C:/Windows/Fonts/msyh.ttc", 0)]
     } else if cfg!(target_os = "macos") {
+        // PingFang is what the design language assumes, but macOS 15+ no
+        // longer ships it as a file in every install - it can arrive later as
+        // a downloadable asset. Hiragino Sans GB is the CJK face that has been
+        // in /System/Library/Fonts for every release, so it is the safety net.
         &[
             ("/System/Library/Fonts/PingFang.ttc", 0),
+            ("/System/Library/Fonts/Hiragino Sans GB.ttc", 0),
+            ("/System/Library/Fonts/Supplemental/Songti.ttc", 0),
             ("/Library/Fonts/NotoSansCJK-Medium.ttc", SC_FACE),
         ]
     } else {
@@ -1826,6 +1846,14 @@ fn scan_system_fonts() -> Vec<FontProfile> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for path in font_files() {
+        // LastResort and CJKSymbolsFallback are the "I have no glyph for this"
+        // faces: they answer every probe with something, so either of them
+        // would win the default slot on a machine whose real CJK faces were
+        // filtered out - and then draw hollow boxes for the whole script.
+        let lower = path.to_ascii_lowercase();
+        if lower.contains("lastresort") || lower.contains("cjksymbols") {
+            continue;
+        }
         let mut fallback: Option<FontProfile> = None;
         for face in 0..faces_in(&path) {
             let Some(mut ft) = ft2::Ft::open(&path, 24, face) else { break };
