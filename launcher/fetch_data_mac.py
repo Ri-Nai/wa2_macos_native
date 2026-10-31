@@ -41,6 +41,24 @@ KEEP = {
     "movie", "movie_2x",
 }
 
+# Parts that hold only trees in KEEP's complement, so they never need to be
+# downloaded at all: parts 2-3 are bg_2x, 8-15 are the bg_8x masters, 18-19 are
+# the 1440p movie remaster, 25-27 are the sprite_8x masters. Together that is
+# about 25 GB of the 45.6 GB release. The boundaries were read out of each
+# part's zip central directory (`data/<tree>/` entries), and a part is only
+# listed here when *every* entry in it is unwanted - parts that straddle two
+# trees (4, 7, 16, 17, 20-22, 24, 28) still get downloaded whole.
+SKIP_PARTS = {
+    "data-v1.1.0.part002.zip", "data-v1.1.0.part003.zip",
+    "data-v1.1.0.part008.zip", "data-v1.1.0.part009.zip",
+    "data-v1.1.0.part010.zip", "data-v1.1.0.part011.zip",
+    "data-v1.1.0.part012.zip", "data-v1.1.0.part013.zip",
+    "data-v1.1.0.part014.zip", "data-v1.1.0.part015.zip",
+    "data-v1.1.0.part018.zip", "data-v1.1.0.part019.zip",
+    "data-v1.1.0.part025.zip", "data-v1.1.0.part026.zip",
+    "data-v1.1.0.part027.zip",
+}
+
 
 def extract(part: Path, data: Path, trees: dict[str, dict]) -> tuple[int, int]:
     files = total = 0
@@ -81,12 +99,17 @@ def main() -> int:
 
     wanted = [t for t in KEEP if t in trees]
     expect = sum(trees[t]["bytes"] for t in wanted)
-    print(f"extracting {len(wanted)} trees, {expect / 1e9:.1f} GB "
-          f"(skipping {sum(v['bytes'] for k, v in trees.items() if k not in KEEP) / 1e9:.1f} GB)")
+    skipped_parts = [p for p in manifest["parts"] if p["name"] in SKIP_PARTS]
+    skipped_bytes = sum(p["size"] for p in skipped_parts)
+    print(f"extracting {len(wanted)} trees, {expect / 1e9:.1f} GB; "
+          f"skipping {len(skipped_parts)} parts ({skipped_bytes / 1e9:.1f} GB) that hold no wanted tree")
     done_files = done_bytes = 0
     for index, part in enumerate(manifest["parts"], 1):
         name, sha = part["name"], part["sha256"]
         local = parts_dir / name
+        if name in SKIP_PARTS:
+            print(f"[{index}/{len(manifest['parts'])}] {name} - skipped", flush=True)
+            continue
         print(f"[{index}/{len(manifest['parts'])}] {name}", flush=True)
         for attempt in range(3):
             try:
