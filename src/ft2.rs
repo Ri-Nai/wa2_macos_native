@@ -175,8 +175,21 @@ impl Ft {
         }
         unsafe {
             let mut lib = std::ptr::null_mut();
-            for cand in ["libfreetype.so.6", "libfreetype.so"] {
-                let c = CString::new(cand).unwrap();
+            // Same runtime-loading story as SDL2: nothing links against
+            // FreeType, so macOS needs the Homebrew prefix spelled out.
+            let candidates: &[&str] = if cfg!(target_os = "macos") {
+                &[
+                    "/opt/homebrew/lib/libfreetype.6.dylib",
+                    "/usr/local/lib/libfreetype.6.dylib",
+                    "/usr/lib/libfreetype.6.dylib",
+                    "libfreetype.6.dylib",
+                    "libfreetype.dylib",
+                ]
+            } else {
+                &["libfreetype.so.6", "libfreetype.so"]
+            };
+            for cand in candidates {
+                let c = CString::new(*cand).unwrap();
                 lib = dlopen(c.as_ptr(), RTLD_NOW);
                 if !lib.is_null() {
                     break;
