@@ -16,10 +16,13 @@ BIN=./target/release/wa2-native
 DATA="${WA2_DATA:-$PWD/data}"
 export WA2_DATA="$DATA"
 
-# 4x is the highest tree a Retina drawable of a 1280x720-point window needs
-# (2560x1440 canvas), and decoding 8x masters would only be downsampled again.
+# 4x is the only art tree a macOS install keeps (the 8x masters are 22 GB and a
+# Retina drawable never asks for more than 4x). `auto` decode follows the
+# drawable instead of forcing the maximum scale, which is what keeps windowed
+# play light: a 1280x720-point window is a 2560x1440 canvas, so 2x is already
+# pixel-exact and 4x would only be supersampled away.
 export WA2_ART_SCALE="${WA2_ART_SCALE:-4}"
-export WA2_RENDER_SCALE="${WA2_RENDER_SCALE:-4}"
+export WA2_RENDER_SCALE="${WA2_RENDER_SCALE:-auto}"
 
 mode=play
 case "${1:-}" in
@@ -41,6 +44,10 @@ if [ ${#missing[@]} -gt 0 ]; then
 fi
 
 if [ ! -d "$DATA/script" ]; then
+  if [ "$mode" = check ]; then
+    echo "素材尚未就绪：${DATA}（正式启动会自动下载）"
+    exit 1
+  fi
   echo "素材尚未就绪（没有 $DATA/script），开始下载。约 45.6 GB，可中断续传。"
   python3 -u launcher/fetch_data_mac.py
 fi
