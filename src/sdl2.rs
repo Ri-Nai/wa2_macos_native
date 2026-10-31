@@ -26,6 +26,11 @@ const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
 /// asks the display to switch to 1280×720, which the compositor ignores, so
 /// the 「全屏」 setting never changed the window.
 const SDL_WINDOW_FULLSCREEN_DESKTOP: u32 = 0x0000_1001;
+/// Ask SDL for a drawable whose pixel count matches the backing store instead
+/// of the window's logical size. On a Retina Mac this is what turns a
+/// 1280x720-point window into a 2560x1440 canvas, so the compositor renders at
+/// native resolution instead of being upscaled by the window server.
+const SDL_WINDOW_ALLOW_HIGHDPI: u32 = 0x0000_2000;
 const SDL_WINDOWPOS_CENTERED: i32 = 0x2FFF_0000u32 as i32;
 const SDL_RENDERER_ACCELERATED: u32 = 0x0000_0002;
 const SDL_RENDERER_SOFTWARE: u32 = 0x0000_0001;
@@ -86,6 +91,9 @@ pub struct Sdl {
     f_render_read_pixels: unsafe extern "C" fn(*mut c_void, *const c_void, u32, *mut c_void, c_int) -> c_int,
     f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char,
     f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int),
+    /// `SDL_GetWindowSizeInPixels` (SDL >= 2.26). Optional: older runtimes and
+    /// every non-high-DPI platform keep using `f_get_window_size`.
+    f_get_window_size_pixels: Option<unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int)>,
     f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_destroy_texture: unsafe extern "C" fn(*mut c_void),
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
@@ -250,6 +258,8 @@ impl Sdl {
         let f_get_pixel_format_name: unsafe extern "C" fn(u32) -> *const c_char = std::mem::transmute(sym(lib, "SDL_GetPixelFormatName")?);
         let f_get_window_size: unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) =
             std::mem::transmute(sym(lib, "SDL_GetWindowSize")?);
+        let f_get_window_size_pixels: Option<unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int)> =
+            sym(lib, "SDL_GetWindowSizeInPixels").map(|p| std::mem::transmute(p));
         let f_open_audio: unsafe extern "C" fn(*const c_char, c_int, *const SdlAudioSpec, *mut SdlAudioSpec, c_int) -> u32 = std::mem::transmute(sym(lib, "SDL_OpenAudioDevice")?);
         let f_queue_audio: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int = std::mem::transmute(sym(lib, "SDL_QueueAudio")?);
         let f_pause_audio: unsafe extern "C" fn(u32, c_int) = std::mem::transmute(sym(lib, "SDL_PauseAudioDevice")?);
@@ -277,6 +287,13 @@ impl Sdl {
         if std::env::var_os("SDL_AUDIODRIVER").is_none() {
             std::env::set_var("SDL_AUDIODRIVER", if cfg!(target_os = "macos") { "coreaudio" } else { "pulse" });
         }
+        // macOS runs SDL's desktop fullscreen in a separate Space by default,
+        // which slides the whole desktop away and back on every F11. The
+        // borderless window over the current Space behaves like fullscreen on
+        // the other platforms and keeps alt-tab cheap.
+        if cfg!(target_os = "macos") && std::env::var_os("SDL_VIDEO_MAC_FULLSCREEN_SPACES").is_none() {
+            std::env::set_var("SDL_VIDEO_MAC_FULLSCREEN_SPACES", "0");
+        }
         let init: unsafe extern "C" fn(u32) -> c_int = std::mem::transmute(s_init);
         // init video+audio together; if that fails, fall back to video only
         let r = init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
@@ -299,7 +316,17 @@ impl Sdl {
             // window resizable. SDL/most window managers derive the maximize
             // button from this flag; fullscreen is deliberately controlled by
             // the in-game display-mode setting (or F11) instead.
-            SDL_WINDOW_SHOWN,
+            //
+            // ALLOW_HIGHDPI is only requested where the pixel-size query
+            // exists (SDL >= 2.26), because without it `window_size` would
+            // report points and the compositor would draw a half-resolution
+            // frame that the window server then upscales.
+            SDL_WINDOW_SHOWN
+                | if cfg!(target_os = "macos") && f_get_window_size_pixels.is_some() {
+                    SDL_WINDOW_ALLOW_HIGHDPI
+                } else {
+                    0
+                },
         );
         if window.is_null() {
             return None;
@@ -345,6 +372,7 @@ impl Sdl {
             f_render_read_pixels,
             f_get_pixel_format_name,
             f_get_window_size,
+            f_get_window_size_pixels,
             f_poll_event,
             f_destroy_texture,
             f_destroy_renderer,
@@ -785,7 +813,26 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
 }
 
     /// Current window size in pixels (the surface is stretched to it).
+    /// Size of the surface the compositor should produce, in **device pixels**.
+    ///
+    /// On a high-DPI display this is the backing store (2x the logical window),
+    /// which is exactly the canvas `present` stretches over the whole window -
+    /// so art decoded for this size lands 1:1 on screen instead of being
+    /// upscaled. Everywhere else it equals the logical size.
     pub fn window_size(&self) -> (i32, i32) {
+        let (mut w, mut h) = (0i32, 0i32);
+        unsafe {
+            match self.f_get_window_size_pixels {
+                Some(f) => f(self.window, &mut w, &mut h),
+                None => (self.f_get_window_size)(self.window, &mut w, &mut h),
+            }
+        }
+        (w.max(1), h.max(1))
+    }
+
+    /// Size of the window in logical units - what pointer events are reported
+    /// in, and therefore what `surface_pos` has to divide by.
+    pub fn logical_size(&self) -> (i32, i32) {
         let (mut w, mut h) = (0i32, 0i32);
         unsafe { (self.f_get_window_size)(self.window, &mut w, &mut h); }
         (w.max(1), h.max(1))
@@ -795,7 +842,10 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
     /// (`present` stretches the surface over the whole window, so this is a
     /// plain linear scale).
     pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
-        let (ww, wh) = self.window_size();
+        // Pointer coordinates are in logical window units, the surface is in
+        // device pixels; the ratio between them is the DPI scale, so dividing
+        // by the logical size keeps hit-testing correct on Retina displays.
+        let (ww, wh) = self.logical_size();
         (x * sw as i32 / ww, y * sh as i32 / wh)
     }
 
