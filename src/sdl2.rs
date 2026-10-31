@@ -189,20 +189,47 @@ fn cursor_bitmap(kind: u8) -> ([u8; 32], [u8; 32]) {
     (data, mask)
 }
 
+/// Candidate file names for the SDL2 runtime, in the order to try them.
+///
+/// The engine is not linked against SDL2 - it opens it at runtime - so dyld
+/// never looks in Homebrew's prefix on its own. On macOS that means the
+/// absolute paths have to be spelled out; a bare dylib name alone only works
+/// when the library already sits on the loader's search path.
+fn sdl2_candidates() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "/opt/homebrew/lib/libSDL2-2.0.0.dylib",
+            "/usr/local/lib/libSDL2-2.0.0.dylib",
+            "@rpath/libSDL2-2.0.0.dylib",
+            "libSDL2-2.0.0.dylib",
+            "libSDL2.dylib",
+        ]
+    } else {
+        &["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"]
+    }
+}
+
+/// dlopen the SDL2 runtime, or null when none of the candidates load.
+fn load_sdl2() -> *mut c_void {
+    for cand in sdl2_candidates() {
+        let Ok(c) = CString::new(*cand) else { continue };
+        let lib = unsafe { dlopen(c.as_ptr(), RTLD_NOW) };
+        if !lib.is_null() {
+            return lib;
+        }
+    }
+    std::ptr::null_mut()
+}
+
 impl Sdl {
     /// Try to open a window + streaming texture. Returns None if SDL2 is
     /// unavailable or window creation fails (e.g. no display).
     pub fn new(title: &str, tw: u32, th: u32) -> Option<Sdl> {
-        unsafe {
-            for cand in ["libSDL2-2.0.so.0", "libSDL2.so.0", "libSDL2.so", "libSDL2-2.0.so"] {
-                let c = CString::new(cand).unwrap();
-                let lib = dlopen(c.as_ptr(), RTLD_NOW);
-                if !lib.is_null() {
-                    return Sdl::init_from(lib, title, tw, th);
-                }
-            }
-            None
+        let lib = load_sdl2();
+        if lib.is_null() {
+            return None;
         }
+        unsafe { Sdl::init_from(lib, title, tw, th) }
     }
 
     unsafe fn init_from(lib: *mut c_void, title: &str, tw: u32, th: u32) -> Option<Sdl> {
@@ -241,10 +268,14 @@ impl Sdl {
         let f_show_cursor = sym(lib, "SDL_ShowCursor")
             .map(|p| std::mem::transmute(p));
 
-        // Choose the pulse audio driver BEFORE any SDL_Init (PipeWire system):
-        // SDL picks the driver at init time from SDL_AUDIODRIVER.
+        // Choose the audio driver BEFORE any SDL_Init: SDL picks the driver at
+        // init time from SDL_AUDIODRIVER.
+        //
+        // Linux (PipeWire) needs the explicit pulse request because the ALSA
+        // path is unreliable there. macOS has no PulseAudio at all - asking for
+        // it leaves every device closed, i.e. silent - so it gets CoreAudio.
         if std::env::var_os("SDL_AUDIODRIVER").is_none() {
-            std::env::set_var("SDL_AUDIODRIVER", "pulse");
+            std::env::set_var("SDL_AUDIODRIVER", if cfg!(target_os = "macos") { "coreaudio" } else { "pulse" });
         }
         let init: unsafe extern "C" fn(u32) -> c_int = std::mem::transmute(s_init);
         // init video+audio together; if that fails, fall back to video only
@@ -888,10 +919,10 @@ pub fn sdl_pause_audio(dev: u32, paused: bool) {
     }
 }
 
-/// Name of the active SDL audio driver (diagnostic), e.g. "pulse" / "alsa" / "dummy".
+/// Name of the active SDL audio driver (diagnostic), e.g. "pulse" / "coreaudio" / "dummy".
 pub fn sdl_audio_driver() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
+        let lib = load_sdl2();
         if lib.is_null() { return "?".into(); }
         let p = dlsym(lib, CString::new("SDL_GetCurrentAudioDriver").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
@@ -904,7 +935,7 @@ pub fn sdl_audio_driver() -> String {
 /// SDL_GetError() string (diagnostic).
 pub fn sdl_get_error() -> String {
     unsafe {
-        let lib = dlopen(CString::new("libSDL2-2.0.so.0").unwrap().as_ptr(), RTLD_NOW);
+        let lib = load_sdl2();
         if lib.is_null() { return "?".into(); }
         let p = dlsym(lib, CString::new("SDL_GetError").unwrap().as_ptr());
         if p.is_null() { return "?".into(); }
