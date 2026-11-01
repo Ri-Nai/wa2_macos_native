@@ -17,6 +17,11 @@ use std::thread;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+/// Frames rendered per mix call. 1024 stereo frames is 21.33 ms at 48 kHz and
+/// matches the device buffer requested in `sdl_open_audio`.
+pub const BLOCK_FRAMES: usize = 1024;
+/// Bytes of interleaved s16le produced by one block.
+pub const BLOCK_BYTES: u32 = (BLOCK_FRAMES * CHANNELS as usize * 2) as u32;
 
 /// Mixer categories. The option screen's four volume sliders map onto these:
 /// `all` scales everything, the others scale one kind of sound.
@@ -154,43 +159,74 @@ impl Mixer {
                         .map(|d| d.as_millis() as u64)
                         .unwrap_or(0);
                     let prev = LAST_DBG.load(Ordering::Relaxed);
-                    if now.saturating_sub(prev) < 1000 {
-                        let block = mix_once(&inner2);
-                        crate::sdl2::sdl_queue_audio(dev, &block);
-                        thread::sleep(std::time::Duration::from_micros(21_333));
-                        continue;
+                    if now.saturating_sub(prev) >= 1000 {
+                        LAST_DBG.store(now, Ordering::Relaxed);
+                        let g = inner2.lock().unwrap();
+                        let gains = g.gains;
+                        let names: Vec<String> = g
+                            .streams
+                            .iter()
+                            .filter_map(|s| s.as_ref())
+                            .filter(|st| !st.pcm.is_empty() && st.volume > 0.001)
+                            .map(|st| {
+                                let p = std::path::Path::new(&st.label);
+                                let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+                                let eff = st.volume * gains[0] * gains[st.cat];
+                                if eff < 0.99 { format!("{}@{:.2}", f, eff) } else { f }
+                            })
+                            .collect();
+                        let slots = g.streams.len();
+                        drop(g);
+                        let depth_ms = crate::sdl2::sdl_queued_audio_bytes(dev)
+                            .map(|b| b as f32 / (SAMPLE_RATE as f32 * CHANNELS as f32 * 2.0) * 1000.0);
+                        eprintln!(
+                            "  audio: n={} slots={} depth={:?} [{}]",
+                            names.len(),
+                            slots,
+                            depth_ms.map(|d| format!("{d:.0}ms")),
+                            names.join(" + ")
+                        );
                     }
-                    LAST_DBG.store(now, Ordering::Relaxed);
-                    let g = inner2.lock().unwrap();
-                    let live = g
-                        .streams
-                        .iter()
-                        .filter(|s| s.as_ref().map(|st| !st.eos || !st.pcm.is_empty()).unwrap_or(false))
-                        .count();
-                    let gains = g.gains;
-                    let names: Vec<String> = g
-                        .streams
-                        .iter()
-                        .filter_map(|s| s.as_ref())
-                        .filter(|st| !st.pcm.is_empty() && st.volume > 0.001)
-                        .map(|st| {
-                            let p = std::path::Path::new(&st.label);
-                            let f = p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
-                            let eff = st.volume * gains[0] * gains[st.cat];
-                            if eff < 0.99 { format!("{}@{:.2}", f, eff) } else { f }
-                        })
-                        .collect();
-                    let audible = names.len();
-                    let slots = g.streams.len();
-                    drop(g);
-                    eprintln!("  audio: n={} slots={} [{}]", audible, slots, names.join(" + "));
                 }
-                let block = mix_once(&inner2);
-                QUEUED.fetch_add(block.len() as u64, Ordering::Relaxed);
-                crate::sdl2::sdl_queue_audio(dev, &block);
-                // 1024 stereo frames at 48 kHz take ~21.33 ms. Pushing every
-                // 10 ms made the SDL queue grow at over twice real time.
-                thread::sleep(std::time::Duration::from_micros(21_333));
+                // Keep the device topped up to a fixed depth.
+                //
+                // This used to push exactly one block per 21.33 ms sleep. That
+                // is open-loop pacing: the sleep always overshoots a little, the
+                // queue erodes, and on a machine whose cores are busy compositing
+                // a 2560x1440 frame the scheduler can delay this thread for tens
+                // of milliseconds - at which point the device runs dry and the
+                // music clicks. Ask SDL how much it still has and refill only
+                // what is missing; the queue depth then absorbs scheduling
+                // jitter instead of turning it into dropouts.
+                const TARGET_BYTES: u32 = BLOCK_BYTES * 4; // ~85 ms of slack
+                let mut pushed = 0u32;
+                loop {
+                    if pushed >= 8 {
+                        break;
+                    }
+                    match crate::sdl2::sdl_queued_audio_bytes(dev) {
+                        Some(q) if q + BLOCK_BYTES <= TARGET_BYTES => {}
+                        // Full enough, or SDL cannot tell us: stop refilling.
+                        Some(_) => break,
+                        // Pre-2.0.4 SDL has no queue query; fall back to the old
+                        // blind one-block-per-tick pacing.
+                        None => {
+                            if pushed > 0 {
+                                break;
+                            }
+                        }
+                    }
+                    let block = mix_once(&inner2);
+                    QUEUED.fetch_add(block.len() as u64, Ordering::Relaxed);
+                    crate::sdl2::sdl_queue_audio(dev, &block);
+                    pushed += 1;
+                    if crate::sdl2::sdl_queued_audio_bytes(dev).is_none() {
+                        break;
+                    }
+                }
+                // Short naps: the queue is deep, so a few milliseconds of slack
+                // costs nothing and keeps refills responsive after a stall.
+                thread::sleep(std::time::Duration::from_millis(if pushed > 0 { 2 } else { 5 }));
             }
         });
         crate::sdl2::sdl_pause_audio(dev, false);
@@ -296,8 +332,7 @@ impl Drop for Mixer {
 
 /// Mix one block (assume 1024 stereo frames) from all active streams.
 fn mix_once(inner: &Arc<Mutex<MixerInner>>) -> Vec<u8> {
-    const BLOCK: usize = 1024;
-    let frames = BLOCK * CHANNELS as usize;
+    let frames = BLOCK_FRAMES * CHANNELS as usize;
     let mut acc = vec![0i32; frames];
     {
         let mut g = inner.lock().unwrap();

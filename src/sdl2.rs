@@ -168,6 +168,12 @@ unsafe fn sym(lib: *mut c_void, name: &str) -> Option<*mut c_void> {
     if p.is_null() { None } else { Some(p) }
 }
 
+/// Like [`sym`], but for callers that treat the symbol as optional.
+unsafe fn dlsym_typed<T: Copy>(lib: *mut c_void, name: &str) -> Option<T> {
+    let p = sym(lib, name)?;
+    Some(std::mem::transmute_copy(&p))
+}
+
 /// Return SDL's 1-bit cursor data and mask for the normal, hover and pressed
 /// states. SDL copies these buffers during `SDL_CreateCursor`, so stack arrays
 /// are sufficient here.
@@ -301,7 +307,12 @@ impl Sdl {
         // Publish the audio API only after SDL has been loaded. Previously these
         // pointers were resolved but never installed, so Mixer::new always got
         // device 0 and every run was silent.
-        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, get_error: f_get_error });
+        // Optional: the mixer only needs it to pace itself, and a missing
+        // symbol degrades to the old fixed-timer behaviour rather than failing
+        // window creation.
+        let f_queued_audio: Option<unsafe extern "C" fn(u32) -> u32> =
+            dlsym_typed(lib, "SDL_GetQueuedAudioSize");
+        let _ = AUDIO.set(AudioFns { open: f_open_audio, queue: f_queue_audio, pause: f_pause_audio, get_error: f_get_error, queued: f_queued_audio });
         let f_full: unsafe extern "C" fn(*mut c_void, u32) -> c_int =
             std::mem::transmute(sym(lib, "SDL_SetWindowFullscreen")?);
         let _ = FULLSCREEN.set(f_full);
@@ -919,6 +930,8 @@ struct AudioFns {
     queue: unsafe extern "C" fn(u32, *const c_void, u32) -> c_int,
     pause: unsafe extern "C" fn(u32, i32),
     get_error: unsafe extern "C" fn() -> *const c_char,
+    /// Absent on SDL2 older than 2.0.4, hence optional.
+    queued: Option<unsafe extern "C" fn(u32) -> u32>,
 }
 
 static AUDIO: OnceLock<AudioFns> = OnceLock::new();
@@ -960,6 +973,18 @@ pub fn sdl_queue_audio(dev: u32, bytes: &[u8]) {
     if let Some(f) = AUDIO.get() {
         unsafe { (f.queue)(dev, bytes.as_ptr() as *const c_void, bytes.len() as u32); }
     }
+}
+
+/// Bytes still waiting in the device's queue, or `None` when the SDL build is
+/// too old to answer.
+///
+/// The mixer is a push design - nothing calls back into us when the device runs
+/// dry - so this is the only way to know whether we are ahead of or behind the
+/// clock. Pacing blindly on a timer drifts: the sleep is always a little long,
+/// the queue drains, and every underrun is an audible click.
+pub fn sdl_queued_audio_bytes(dev: u32) -> Option<u32> {
+    let f = AUDIO.get().and_then(|f| f.queued)?;
+    Some(unsafe { f(dev) })
 }
 
 /// Resume (paused=false) or pause the device.
