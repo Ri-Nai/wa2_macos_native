@@ -298,6 +298,55 @@ impl Surface {
         }
     }
 
+    /// Add a whole image onto the surface, scaled to the given rectangle.
+    ///
+    /// The `f0NNN` plates an ACT146/147 `mode >= 0x80` selects are greyscale
+    /// *light maps*, not pictures: `f0000` is a sun disc, `f0046` a wall of
+    /// out-of-focus lights, `f0024` a band of reflected light on water. Their
+    /// alpha is 255 everywhere and the luminance carries the effect, so they
+    /// have to be added. Pasting one with alpha (what this used to do) replaces
+    /// the background with the mask alone - a lit window floating in a black
+    /// screen, or an indoor scene turned into a grey blob.
+    pub fn add_scaled(&mut self, img: &TgaImage, dw: u32, dh: u32, strength: u8) {
+        if dw == 0 || dh == 0 || img.width == 0 || img.height == 0 || strength == 0 {
+            return;
+        }
+        let shrink = img.width > dw || img.height > dh;
+        for row in 0..dh {
+            for col in 0..dw {
+                let x = col as i32;
+                let y = row as i32;
+                if x >= self.width as i32 || y >= self.height as i32 {
+                    continue;
+                }
+                let c = if shrink {
+                    let x0 = (col as u64 * img.width as u64 / dw as u64) as i32;
+                    let x1 = ((col as u64 + 1) * img.width as u64 / dw as u64) as i32;
+                    let y0 = (row as u64 * img.height as u64 / dh as u64) as i32;
+                    let y1 = ((row as u64 + 1) * img.height as u64 / dh as u64) as i32;
+                    area_sample(img, x0, y0, x1, y1)
+                } else {
+                    let sy = (row as u64 * img.height as u64 / dh as u64) as u32;
+                    let sx = (col as u64 * img.width as u64 / dw as u64) as u32;
+                    let si = ((sy.min(img.height - 1) * img.width + sx.min(img.width - 1)) * 4) as usize;
+                    [img.rgba[si], img.rgba[si + 1], img.rgba[si + 2], img.rgba[si + 3]]
+                };
+                if c[3] == 0 {
+                    continue;
+                }
+                let k = c[3] as u32 * strength as u32 / 255;
+                if k == 0 {
+                    continue;
+                }
+                let di = ((y as u32 * self.width + x as u32) * 4) as usize;
+                for ch in 0..3 {
+                    self.pixels[di + ch] =
+                        (self.pixels[di + ch] as u32 + c[ch] as u32 * k / 255).min(255) as u8;
+                }
+            }
+        }
+    }
+
     /// Nearest-neighbour scale of a whole image.  This is kept separate from
     /// `blit_region_scaled` because the scene background is opaque in normal
     /// play and covers almost every output pixel.  It avoids the per-pixel
@@ -786,22 +835,11 @@ pub fn compose_scene_art(
     // made every character look unlit.
     s.dim(shade);
 
-    // ACT146/147 mode >= 0x80 selects an opaque full-screen f0NNN effect
-    // plate. It belongs between the dimmed background and the standing
-    // sprites; drawing it later would incorrectly tint or cover the cast.
+    // ACT146/147 mode >= 0x80 selects a full-screen `f0NNN` light map. It is
+    // added on top of the dimmed background, under the standing sprites: the
+    // cast stays crisp while the room behind them is lit.
     if let Some(effect) = effect {
-        s.blit_region_scaled(
-            effect,
-            0,
-            0,
-            effect.width,
-            effect.height,
-            0,
-            0,
-            w,
-            h,
-            255,
-        );
+        s.add_scaled(effect, w, h, 255);
     }
 
     // Standing character sprites (bottom-anchored), below the dialog box.
@@ -1560,7 +1598,50 @@ mod tests {
             let i = ((y * composed.width + x) * 4) as usize;
             [composed.pixels[i], composed.pixels[i + 1], composed.pixels[i + 2]]
         };
-        assert_eq!(px(0, 0), [180, 20, 30]);
+        // The `f0NNN` plate is a light map, not a picture: it is added over the
+        // dimmed background and under the cast. Pasted with alpha (the old
+        // behaviour) the mask alone became the screen - the "black background"
+        // that hid the classroom behind a wall of bokeh.
+        let lit = px(0, 0);
+        // Background (20,40,80) dimmed by 120 -> (10,21,42), plus the plate's
+        // own (180,20,30).
+        assert_eq!(lit, [190, 41, 72]);
         assert_eq!(px(640, 0), [250, 250, 250]);
+    }
+
+    #[test]
+    fn an_opaque_light_plate_never_covers_the_background() {
+        use super::compose_scene_art;
+        use crate::codec::tga::TgaImage;
+        let bg = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [60u8, 60, 60, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        // A plate with no picture in it at all: alpha 255 everywhere, every
+        // pixel black. Added, it changes nothing.
+        let black = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [0u8, 0, 0, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        let composed = compose_scene_art(
+            &bg, Some(&black), LAYOUT_W, LAYOUT_H, &[], None, false, None, None, 255, 0, &[],
+        );
+        let i = ((100 * composed.width + 100) * 4) as usize;
+        assert_eq!(&composed.pixels[i..i + 3], &[60, 60, 60]);
+
+        // And a fully white one is a whiteout, not a colour of its own.
+        let mut white = black.clone();
+        for px in white.rgba.chunks_mut(4) {
+            px[0] = 255;
+            px[1] = 255;
+            px[2] = 255;
+        }
+        let composed = compose_scene_art(
+            &bg, Some(&white), LAYOUT_W, LAYOUT_H, &[], None, false, None, None, 255, 0, &[],
+        );
+        let i = ((100 * composed.width + 100) * 4) as usize;
+        assert_eq!(&composed.pixels[i..i + 3], &[255, 255, 255]);
     }
 }
