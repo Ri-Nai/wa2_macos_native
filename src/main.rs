@@ -686,8 +686,8 @@ fn main() {
                             println!("  [bg  ] id={} var={} mode={} frames={}", id, variant, mode, frames),
                         vm::lscr::Event::EventCg { id, variant, frames } =>
                             println!("  [cg  ] id={} var={} frames={}", id, variant, frames),
-                        vm::lscr::Event::ScrollCg { id, variant, frames } =>
-                            println!("  [cg-scroll] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::ScrollCg { id, variant, frames, pages } =>
+                            println!("  [cg-scroll] id={} var={} frames={} pages={}", id, variant, frames, pages),
                         vm::lscr::Event::Flash { frames, r, g, b } =>
                             println!("  [flash] {},{},{} {}f", r, g, b, frames),
                         vm::lscr::Event::Overlay { name, slot } => println!("  [ovl ] slot={} {}", slot, name),
@@ -2691,7 +2691,7 @@ fn run_game_at(
                         return Ok(None);
                     }
                 }
-                vm::lscr::Event::ScrollCg { id, variant, frames } => {
+                vm::lscr::Event::ScrollCg { id, variant, frames, pages } => {
                     // ACT227. Two pictures in the game are several screens
                     // tall (v201900 is 1280x2160, v200000 is 1280x3362) and the
                     // original drags them up through the frame like a scroll;
@@ -2712,10 +2712,19 @@ fn run_game_at(
                             let img = asset.img;
                             // One screenful of the picture, in its own pixels.
                             let page_h = (img.width as u64 * 9 / 16) as u32;
-                            let travel = img.height.saturating_sub(page_h);
+                            // How far the window walks. The record names it
+                            // outright ("720, 2" for v201900, "720, 3" for
+                            // v200000); a short picture says 0 and gets the
+                            // height it happens to have.
+                            let travel = if pages > 0 {
+                                (pages as u64 * page_h as u64)
+                                    .min(img.height.saturating_sub(page_h) as u64) as u32
+                            } else {
+                                img.height.saturating_sub(page_h)
+                            };
                             eprintln!(
-                                "scene {} | cg-scroll {} id={} var={} fade={}f ({}x{}, travel {})",
-                                current_id, name, id, variant, frames, img.width, img.height, travel
+                                "scene {} | cg-scroll {} id={} var={} fade={}f pages={} ({}x{}, travel {})",
+                                current_id, name, id, variant, frames, pages, img.width, img.height, travel
                             );
                             let dragged = travel > 2 && !cmd_skip;
                             if dragged {
@@ -2724,7 +2733,14 @@ fn run_game_at(
                                 let steps = frames.clamp(90, 200);
                                 let mut quit = false;
                                 for step in 0..=steps {
-                                    let y = (travel as u64 * step as u64 / steps as u64) as u32;
+                                    // The window starts on the last screenful
+                                    // of the picture - her feet - and is
+                                    // dragged up to the first, her face. The
+                                    // smoothstep keeps both ends of the move
+                                    // slow, the way a camera pull reads.
+                                    let t = step as f64 / steps as f64;
+                                    let e = t * t * (3.0 - 2.0 * t);
+                                    let y = (travel as f64 * (1.0 - e)) as u32;
                                     let Some(crop) = crop_image(&img, 0, y, img.width, page_h) else { break };
                                     bg = crop;
                                     line_base = None;
@@ -2747,7 +2763,10 @@ fn run_game_at(
                                     return Ok(None);
                                 }
                             }
-                            if let Some(crop) = crop_image(&img, 0, travel, img.width, page_h) {
+                            // The picture comes to rest on its first
+                            // screenful: the drag ended at her face, so that
+                            // is what stays behind the dialogue.
+                            if let Some(crop) = crop_image(&img, 0, 0, img.width, page_h) {
                                 bg = crop;
                             }
                             line_base = None;

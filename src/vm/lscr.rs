@@ -264,7 +264,12 @@ pub enum Event {
     /// drags them up through the 720-px frame; the short ones behave exactly
     /// like an `EventCg`. Nothing was handling the opcode at all, which is why
     /// the cut to black before one of them never turned into a picture.
-    ScrollCg { id: i64, variant: u32, frames: u32 },
+    ///
+    /// `pages` is the record's own trailing count of screenfuls the picture
+    /// travels (`... 0, 0, 720, 2` for v201900, `720, 3` for v200000). It is
+    /// 0 for every short picture, which is what makes them behave like an
+    /// `EventCg`.
+    ScrollCg { id: i64, variant: u32, frames: u32, pages: u32 },
     /// ACT152 `(subtype, frames, r, g, b)`. The screen snaps to that colour
     /// and fades back to the picture over `frames` at 60 fps. White is the
     /// climax flash; the subtype is unused (the snap itself is instant).
@@ -718,6 +723,7 @@ impl<'a> Interp<'a> {
                         id: cg as i64,
                         variant: self.ints[2].max(0) as u32,
                         frames: self.ints[3].max(0) as u32,
+                        pages: self.ints.get(7).copied().unwrap_or(0).max(0) as u32,
                     });
                 }
             }
@@ -900,6 +906,7 @@ impl<'a> Interp<'a> {
                         id: self.ints[1] as i64,
                         variant: self.ints[2].max(0) as u32,
                         frames: self.ints[3].max(0) as u32,
+                        pages: self.ints.get(7).copied().unwrap_or(0).max(0) as u32,
                     });
                 }
                 None
