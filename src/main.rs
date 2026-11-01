@@ -686,6 +686,8 @@ fn main() {
                             println!("  [bg  ] id={} var={} mode={} frames={}", id, variant, mode, frames),
                         vm::lscr::Event::EventCg { id, variant, frames } =>
                             println!("  [cg  ] id={} var={} frames={}", id, variant, frames),
+                        vm::lscr::Event::ScrollCg { id, variant, frames } =>
+                            println!("  [cg-scroll] id={} var={} frames={}", id, variant, frames),
                         vm::lscr::Event::Flash { frames, r, g, b } =>
                             println!("  [flash] {},{},{} {}f", r, g, b, frames),
                         vm::lscr::Event::Overlay { name, slot } => println!("  [ovl ] slot={} {}", slot, name),
@@ -2687,6 +2689,79 @@ fn run_game_at(
                     cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
                     if present_fade(win, &old, &cur_surf, fade_len(&settings, cmd_skip, frames)) {
                         return Ok(None);
+                    }
+                }
+                vm::lscr::Event::ScrollCg { id, variant, frames } => {
+                    // ACT227. Two pictures in the game are several screens
+                    // tall (v201900 is 1280x2160, v200000 is 1280x3362) and the
+                    // original drags them up through the frame like a scroll;
+                    // everything else the opcode shows behaves like an ACT148.
+                    // Without this arm the black ACT146 in front of it stayed
+                    // on screen for the whole scene.
+                    let old = clone_surf(&cur_surf);
+                    let name = event_cg_name(id, variant);
+                    match load_background_asset(&s.bg_dirs(), &name) {
+                        Some(asset) => {
+                            plates.clear();
+                            slots = Default::default();
+                            bg_cg = true;
+                            bg_id = Some((id, variant));
+                            bg_label = name.clone();
+                            bg_scale = Some(asset.art_scale);
+                            bg_src_scale = Some(asset.src_scale);
+                            let img = asset.img;
+                            // One screenful of the picture, in its own pixels.
+                            let page_h = (img.width as u64 * 9 / 16) as u32;
+                            let travel = img.height.saturating_sub(page_h);
+                            eprintln!(
+                                "scene {} | cg-scroll {} id={} var={} fade={}f ({}x{}, travel {})",
+                                current_id, name, id, variant, frames, img.width, img.height, travel
+                            );
+                            let dragged = travel > 2 && !cmd_skip;
+                            if dragged {
+                                // The script's own transition length, which for
+                                // these pictures is the drag itself.
+                                let steps = frames.clamp(90, 200);
+                                let mut quit = false;
+                                for step in 0..=steps {
+                                    let y = (travel as u64 * step as u64 / steps as u64) as u32;
+                                    let Some(crop) = crop_image(&img, 0, y, img.width, page_h) else { break };
+                                    bg = crop;
+                                    line_base = None;
+                                    line_done = true;
+                                    cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                                    win.present(&cur_surf);
+                                    // A click during the drag drops the rest of
+                                    // it and keeps the picture, like every other
+                                    // timed beat in the engine.
+                                    match win.poll_input() {
+                                        sdl2::Input::Quit => { quit = true; break }
+                                        sdl2::Input::None
+                                        | sdl2::Input::Pointer { pressed: false, .. }
+                                        | sdl2::Input::Drag { .. } => {}
+                                        _ => break,
+                                    }
+                                    win.delay(16);
+                                }
+                                if quit {
+                                    return Ok(None);
+                                }
+                            }
+                            if let Some(crop) = crop_image(&img, 0, travel, img.width, page_h) {
+                                bg = crop;
+                            }
+                            line_base = None;
+                            line_done = true;
+                            cur_surf = draw_scene(&bg, "", None, font, &slots, focus, win_size.0 as u32, win_size.1 as u32, tint.as_deref(), effect.as_ref(), window, msg_plate.as_ref(), msg_frame.as_ref(), &plates, scene_look(&settings, bg_cg), vfont.as_mut());
+                            let fade = if dragged { 0 } else { fade_len(&settings, cmd_skip, frames) };
+                            if present_fade(win, &old, &cur_surf, fade) {
+                                return Ok(None);
+                            }
+                        }
+                        None => eprintln!(
+                            "scene {} | cg-scroll MISSING {} id={} var={}, screen stays {}",
+                            current_id, name, id, variant, bg_label
+                        ),
                     }
                 }
                 vm::lscr::Event::Flash { frames, r, g, b } => {

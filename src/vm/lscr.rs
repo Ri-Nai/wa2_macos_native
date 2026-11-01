@@ -256,6 +256,15 @@ pub enum Event {
     /// It replaces the standing shot. `frames` is the crossfade at 60 fps;
     /// a layer switch passes 0.
     EventCg { id: i64, variant: u32, frames: u32 },
+    /// ACT227: the same picture as an `EventCg`, but the record that describes
+    /// it sits in front of the call instead of inside it.
+    ///
+    /// This is the scroll CG. A handful of event pictures are several screens
+    /// tall (`v201900` is 1280×2160, `v200000` is 1280×3362) and the original
+    /// drags them up through the 720-px frame; the short ones behave exactly
+    /// like an `EventCg`. Nothing was handling the opcode at all, which is why
+    /// the cut to black before one of them never turned into a picture.
+    ScrollCg { id: i64, variant: u32, frames: u32 },
     /// ACT152 `(subtype, frames, r, g, b)`. The screen snaps to that colour
     /// and fades back to the picture over `frames` at 60 fps. White is the
     /// climax flash; the subtype is unused (the snap itself is instant).
@@ -677,6 +686,42 @@ impl<'a> Interp<'a> {
             }
         }
         self.rec_fun = None;
+        // A CG parked in a K30 record and picked up by the ACT227 that follows
+        // it: `(mode, cg_id, variant, frames, 0, 0, h, n)`.
+        //
+        // ACT148 carries the same shape *inside* its own record and shows the
+        // picture itself, so those records have `rec_act_hit` set and never
+        // reach here. ACT227 keeps the payload in the record before it, and
+        // that payload used to be dropped with every other "uninteresting"
+        // record - the screen stayed on the black ACT146 that precedes it.
+        if self.rec_kind == 30 && !self.rec_tok_hit && !self.rec_act_hit && self.ints.len() >= 6 {
+            let mode = self.ints[0];
+            let cg = self.ints[1];
+            if (0..=5).contains(&mode) && cg >= 1000 {
+                let mut j = self.pc;
+                let mut steps = 0;
+                let mut used_by_227 = false;
+                while j < self.p.ops.len() && steps < 16 {
+                    match &self.p.ops[j] {
+                        Op::Act { id, .. } => {
+                            used_by_227 = *id == 227;
+                            break;
+                        }
+                        Op::Tok { .. } | Op::Goto { .. } | Op::Return { .. } => break,
+                        _ => {}
+                    }
+                    j += 1;
+                    steps += 1;
+                }
+                if used_by_227 {
+                    return Some(Event::ScrollCg {
+                        id: cg as i64,
+                        variant: self.ints[2].max(0) as u32,
+                        frames: self.ints[3].max(0) as u32,
+                    });
+                }
+            }
+        }
         if self.rec_kind != 30 || self.rec_tok_hit || self.rec_act_hit || self.ints.len() != 3 {
             return None;
         }
@@ -839,6 +884,22 @@ impl<'a> Interp<'a> {
                         r: ch(2),
                         g: ch(3),
                         b: ch(4),
+                    });
+                }
+                None
+            }
+            227 => {
+                // The scroll/effects CG. Most calls repeat the picture record
+                // inline `(mode, cg_id, variant, frames, ...)`; the ones whose
+                // payload sits in the preceding K30 record are raised by
+                // `finish_record` instead, and `mode 0` is a clear we leave
+                // alone rather than blanking a picture the script did not ask
+                // to lose.
+                if self.ints.len() >= 4 && self.ints[1] >= 1000 {
+                    return Some(Event::ScrollCg {
+                        id: self.ints[1] as i64,
+                        variant: self.ints[2].max(0) as u32,
+                        frames: self.ints[3].max(0) as u32,
                     });
                 }
                 None
