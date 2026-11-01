@@ -6967,12 +6967,32 @@ pub enum UiSe {
     Page,
 }
 
+impl UiSe {
+    /// Index into [`UiSound::pcm`].
+    fn slot(self) -> usize {
+        match self {
+            UiSe::Move => 0,
+            UiSe::Confirm => 1,
+            UiSe::Cancel => 2,
+            UiSe::Page => 3,
+        }
+    }
+}
+
 /// The four menu sounds, resolved once per screen.
 pub struct UiSound {
     mv: Option<std::path::PathBuf>,
     ok: Option<std::path::PathBuf>,
     cancel: Option<std::path::PathBuf>,
     page: Option<std::path::PathBuf>,
+    /// Decoded once and kept for the lifetime of the screen.
+    ///
+    /// A menu sound plays several times a second while the player browses, and
+    /// decoding one through a decoder subprocess cost 31 ms warm and 189 ms
+    /// cold, with the mixer lock held the whole time. That is visible as a
+    /// frozen frame and audible as a hole in the BGM, so the pixel-accurate
+    /// short sounds are simply held in memory instead.
+    pcm: [Option<std::sync::Arc<Vec<i16>>>; 4],
 }
 
 impl UiSound {
@@ -6980,12 +7000,20 @@ impl UiSound {
     pub fn resolve(dirs: &[&std::path::Path]) -> UiSound {
         let mv = find_se(dirs, SE_CLICK);
         let ok = find_se(dirs, SE_UI);
-        UiSound {
-            mv: mv.clone(),
-            ok: ok.clone(),
-            cancel: find_se(dirs, SE_UI_CANCEL).or(ok),
-            page: mv,
-        }
+        let cancel = find_se(dirs, SE_UI_CANCEL).or_else(|| ok.clone());
+        let page = mv.clone();
+        let pcm = [
+            cached_pcm(mv.as_deref()),
+            cached_pcm(ok.as_deref()),
+            cached_pcm(cancel.as_deref()),
+            cached_pcm(page.as_deref()),
+        ];
+        UiSound { mv, ok, cancel, page, pcm }
+    }
+
+    /// Decoded buffer for a role, if one could be prepared.
+    pub fn pcm(&self, kind: UiSe) -> Option<&std::sync::Arc<Vec<i16>>> {
+        self.pcm[kind.slot()].as_ref()
     }
 
     pub fn path(&self, kind: UiSe) -> Option<&std::path::Path> {
@@ -6996,6 +7024,28 @@ impl UiSound {
             UiSe::Page => self.page.as_deref(),
         }
     }
+}
+
+/// Process-wide cache of decoded menu sounds.
+///
+/// Every menu screen calls `UiSound::resolve` when it opens, and they all ask
+/// for the same four files. Without this each screen would pay the decode again
+/// on open.
+fn cached_pcm(path: Option<&std::path::Path>) -> Option<std::sync::Arc<Vec<i16>>> {
+    type Cache =
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, Option<std::sync::Arc<Vec<i16>>>>>;
+    static CACHE: std::sync::OnceLock<Cache> = std::sync::OnceLock::new();
+    let path = path?;
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut g = cache.lock().unwrap();
+    if let Some(hit) = g.get(path) {
+        return hit.clone();
+    }
+    // A failure is cached too: retrying the decode on every screen would only
+    // add the same 31 ms to each open.
+    let decoded = audio::mixer::decode_pcm(path);
+    g.insert(path.to_path_buf(), decoded.clone());
+    decoded
 }
 
 /// `SE_{id:04}` next to the art trees, in either container format.
@@ -7015,10 +7065,13 @@ fn find_se(dirs: &[&std::path::Path], id: u32) -> Option<std::path::PathBuf> {
 /// Play one menu sound through the mixer at the SE group volume.
 pub fn play_ui(mixer: Option<&audio::Mixer>, sounds: Option<&UiSound>, kind: UiSe) {
     let (Some(mx), Some(s)) = (mixer, sounds) else { return };
-    let Some(p) = s.path(kind) else { return };
-    if mx.play_cat(&p.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE) != usize::MAX {
-        eprintln!("  SE: menu {:?} -> {}", kind, p.display());
+    if let Some(buf) = s.pcm(kind) {
+        mx.play_pcm(std::sync::Arc::clone(buf), 1.0, false, audio::mixer::CAT_SE);
+        return;
     }
+    // Only reached if the file could not be decoded up front.
+    let Some(p) = s.path(kind) else { return };
+    mx.play_cat(&p.to_string_lossy(), 1.0, false, audio::mixer::CAT_SE);
 }
 /// Font size that has the same height, in window pixels, as `layout_px` on
 /// the 720-tall layout. Labels are drawn after the scene is scaled, so this

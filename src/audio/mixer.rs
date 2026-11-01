@@ -48,6 +48,15 @@ pub struct Stream {
     cat: usize,
     carry: Vec<u8>,
     child: Option<Child>,
+    /// Fully decoded PCM held in memory instead of piped from a decoder.
+    ///
+    /// Short UI sounds are played far more often than any other kind of audio,
+    /// and spawning `ffmpeg` for one costs tens of milliseconds - on a cold
+    /// cache hundreds - which is long enough to be seen as a dropped frame and
+    /// heard as a hole in the music. When this is set the worker feeds `pcm`
+    /// straight from here and there is no child process at all.
+    mem: Option<Arc<Vec<i16>>>,
+    mem_pos: usize,
     /// raw s16le frames not yet mixed
     pcm: VecDeque<i16>,
     pub volume: f32,
@@ -68,9 +77,51 @@ impl Stream {
         let fd = child.stdout.as_ref()?.as_raw_fd();
         unsafe { let flags = fcntl(fd, 3); if flags >= 0 { fcntl(fd, 4, flags | 0x800); } }
         Some(Stream { label: input.to_string(), cat: CAT_ALL, carry: Vec::new(),
-            child: Some(child), pcm: VecDeque::new(), volume: 1.0, looping, eos: false,
+            child: Some(child), mem: None, mem_pos: 0,
+            pcm: VecDeque::new(), volume: 1.0, looping, eos: false,
             ramp: None })
     }
+
+    /// A stream backed by an already decoded buffer.
+    fn from_pcm(pcm: Arc<Vec<i16>>, looping: bool) -> Stream {
+        Stream {
+            label: String::from("<pcm>"),
+            cat: CAT_ALL,
+            carry: Vec::new(),
+            child: None,
+            mem: Some(pcm),
+            mem_pos: 0,
+            pcm: VecDeque::new(),
+            volume: 1.0,
+            looping,
+            eos: false,
+            ramp: None,
+        }
+    }
+}
+
+/// Decode a whole file to 48 kHz stereo s16le in memory.
+///
+/// Only meant for files whose duration is known to be short (UI sounds); the
+/// caller holds the buffer for as long as the sound may be replayed, so this
+/// must not be used for BGM or voice.
+pub fn decode_pcm(path: &std::path::Path) -> Option<Arc<Vec<i16>>> {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(path)
+        .args(["-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.len() < 2 {
+        return None;
+    }
+    let mut pcm = Vec::with_capacity(out.stdout.len() / 2);
+    for b in out.stdout.chunks_exact(2) {
+        pcm.push(i16::from_le_bytes([b[0], b[1]]));
+    }
+    Some(Arc::new(pcm))
 }
 
 /// The mixer owns the SDL audio device and all active streams.
@@ -109,6 +160,22 @@ impl Mixer {
                     for s in g.streams.iter_mut() {
                         if let Some(st) = s {
                             if st.eos || st.pcm.len() >= 8192 { continue; }
+                            // In-memory source: refill from the buffer, no pipe.
+                            if let Some(src) = st.mem.clone() {
+                                while st.pcm.len() < 8192 && st.mem_pos < src.len() {
+                                    let n = (8192 - st.pcm.len()).min(src.len() - st.mem_pos);
+                                    st.pcm.extend(src[st.mem_pos..st.mem_pos + n].iter().copied());
+                                    st.mem_pos += n;
+                                }
+                                if st.mem_pos >= src.len() {
+                                    if st.looping {
+                                        st.mem_pos = 0;
+                                    } else {
+                                        st.eos = true;
+                                    }
+                                }
+                                continue;
+                            }
                             let mut buf = [0u8; 4096];
                             if let Some(child) = st.child.as_mut() {
                                 if let Some(out) = child.stdout.as_mut() {
@@ -249,6 +316,41 @@ impl Mixer {
         s.cat = cat.min(CAT_COUNT - 1);
         g.streams.push(Some(s));
         g.streams.len() - 1
+    }
+
+    /// Play an already decoded buffer.
+    ///
+    /// This is what UI sounds use: no process to spawn, no pipe to refill, so
+    /// the call is a mutex acquisition and a push - small enough to sit in the
+    /// frame that handled the key press without costing a frame.
+    pub fn play_pcm(&self, pcm: Arc<Vec<i16>>, volume: f32, looping: bool, cat: usize) -> usize {
+        let mut s = Stream::from_pcm(pcm, looping);
+        s.volume = volume;
+        s.looping = looping;
+        s.cat = cat.min(CAT_COUNT - 1);
+        let mut g = self.inner.lock().unwrap();
+        // Reuse a finished slot instead of pushing a new one.
+        //
+        // This is called on every key press, and whoever starts a menu sound
+        // never stops it, so a dead slot is free for the taking. Reusing keeps
+        // the stream list the size of "sounds playing right now" rather than
+        // growing by one per click - 40 clicks in a row left 41 slots behind,
+        // and the mix loop walks every one of them on every block.
+        let dead = g.streams.iter().position(|s| {
+            s.as_ref()
+                .map(|st| st.eos && st.pcm.is_empty() && st.child.is_none())
+                .unwrap_or(false)
+        });
+        match dead {
+            Some(i) => {
+                g.streams[i] = Some(s);
+                i
+            }
+            None => {
+                g.streams.push(Some(s));
+                g.streams.len() - 1
+            }
+        }
     }
 
     /// Set one of the option screen's volume sliders (linear gain, 1.0 = 100%).
