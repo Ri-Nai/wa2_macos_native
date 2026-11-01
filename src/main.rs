@@ -9052,6 +9052,7 @@ mod rewind_history {
     }
 }
 
+#[cfg(test)]
 mod backlog_paint {
     #[test]
     fn history_paints_the_banner_and_the_lines() {
@@ -9504,6 +9505,7 @@ mod scene_cache_tests {
     }
 }
 
+#[cfg(test)]
 mod bgm_variant_tests {
     use super::bgm_file;
     use std::path::PathBuf;
