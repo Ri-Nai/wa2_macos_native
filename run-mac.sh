@@ -58,7 +58,7 @@ if [ ! -d "$DATA/script" ]; then
     echo "素材尚未就绪：${DATA}（正式启动会自动下载）"
     exit 1
   fi
-  echo "素材尚未就绪（没有 $DATA/script），开始下载。约 45.6 GB，可中断续传。"
+  echo "素材尚未就绪（没有 $DATA/script），开始下载。约 15 GB（只取 4x 素材树），可中断续传。"
   python3 -u launcher/fetch_data_mac.py
 fi
 

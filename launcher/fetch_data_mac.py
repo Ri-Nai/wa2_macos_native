@@ -8,7 +8,7 @@ Differences from launcher/fetch_data.py (which targets the Linux AppImage):
 * extracts one part at a time and deletes it immediately, so the 45.6 GB of
   zips never sit on disk next to the whole 50.8 GB tree;
 * skips the trees a 4x render never reads (bg_8x ~15 GB, sprite_8x ~7 GB,
-  the 2x art siblings), which keeps a full install around 21 GB instead of 51.
+  the 2x art siblings), which keeps a full install around 14 GB instead of 51.
 
 Everything that is extracted still comes from the signed-off release: each part
 is checked against the manifest SHA-256 before a byte of it is written.
