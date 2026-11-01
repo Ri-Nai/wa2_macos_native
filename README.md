@@ -272,6 +272,36 @@ wa2-native/
 ~~~
 
 <details>
+<summary><strong>源码结构</strong></summary>
+
+`src/main.rs` 只负责把各个子系统接起来并提供入口点，各子系统按职责分文件：
+
+| 模块 | 职责 |
+| :--- | :--- |
+| `cli.rs` | 命令行入口与各个子命令 |
+| `assets.rs` | 素材树读取：背景、光效、滤镜、界面图块、缩放策略 |
+| `session.rs` | 跨场景的状态：背景索引、预取队列、播放会话 |
+| `sprite.rs` | 立绘：槽位、素材目录、立绘缓存 |
+| `scene.rs` | 场景合成：背景 + 光效 + 滤镜 + 立绘 |
+| `game.rs` | 运行时与剧本解释器主循环 |
+| `rewind.rs` | 回溯：行历史、回溯步进、存档快照 |
+| `backlog.rs` | 履历画面 |
+| `choice.rs` | 选项行 |
+| `cmd.rs` | 命令栏与它打开的模态框 |
+| `present.rs` | 转场：淡入淡出、闪光、回溯巡航 |
+| `ui.rs` | 通用界面件：提示条、确认框、菜单栏、标签绘制 |
+| `sound.rs` | 界面音效 |
+| `gallery.rs` | CG、小说与语音信箱 |
+| `special.rs` | 特别模式：番外、音乐与访问计数 |
+| `title.rs` | 标题画面 |
+| `movie.rs` | 影片播放 |
+| `voice.rs` | 语音播放与播放规则 |
+| `font.rs` | 字体加载 |
+| `tests.rs` | 单元测试 |
+
+</details>
+
+<details>
 <summary><strong>从源码构建</strong></summary>
 
 ~~~bash
@@ -292,11 +322,14 @@ cargo test --release
 
 | 位置 | 改动 |
 | :--- | :--- |
-| `src/sdl2.rs` | `dlopen` 候选加入 `libSDL2-2.0.0.dylib` 与 Homebrew 绝对路径；macOS 设 `SDL_AUDIODRIVER=coreaudio`；启用 `SDL_WINDOW_ALLOW_HIGHDPI`，窗口尺寸取 `SDL_GetWindowSizeInPixels` |
+| `src/sdl2.rs` | `dlopen` 候选加入 `libSDL2-2.0.0.dylib` 与 Homebrew 绝对路径；macOS 设 `SDL_AUDIODRIVER=coreaudio`；启用 `SDL_WINDOW_ALLOW_HIGHDPI`，窗口尺寸取 `SDL_GetWindowSizeInPixels`；固定 `delay(16)` 改为补足 16.667 ms 帧预算 |
 | `src/ft2.rs` | FreeType 候选加入 `libfreetype.6.dylib` |
 | `src/render/text.rs` | 字体候选改为 macOS 实际存在的字体，跳过 `.LastResort`；优先仓库自带 Noto Sans CJK SC |
 | `src/audio/mixer.rs` | 音频推流改为查 `SDL_GetQueuedAudioSize` 维持约 85 ms 队列，避免 CoreAudio 下欠载产生的卡顿音 |
-| `src/main.rs` | 固定 `delay(16)` 改为补足 16.667 ms 帧预算；UI 音效预解码为 PCM 并复用槽位；菜单标签描边预渲染；模态框按画布倍率绘制；BGM 选完整版 `_B` 而不是短片段 `_A`；实现 `ACT227` 卷轴 CG（按记录里的屏数从脚往上拖到头）；背景 id 三态化（`0` 切黑 / 负数保持当前画面 / 正常 id 换图） |
+| `src/sound.rs` | UI 音效预解码为 PCM 并复用槽位 |
+| `src/ui.rs` | 菜单标签描边预渲染；模态框按画布倍率绘制 |
+| `src/assets.rs` | BGM 选完整版 `_B` 而不是短片段 `_A`；背景 id 三态化（`0` 切黑 / 负数保持当前画面 / 正常 id 换图） |
+| `src/game.rs` | 实现 `ACT227` 卷轴 CG（按记录里的屏数从脚往上拖到头） |
 | `src/vm/lscr.rs` | 新增 `Event::ScrollCg`，从 `ACT227` 的内联参数或其前面那条 K30 记录取出 (id, variant, frames, pages) |
 | `src/render/mod.rs` | `f0NNN` 光效板改为加算（`Surface::add_scaled`），不再是按 alpha 覆盖背景 |
 
