@@ -442,6 +442,7 @@ impl Sdl {
     /// Upload `surf` pixels to the texture and present, scaled to the window.
     pub fn present(&mut self, surf: &Surface) {
         Self::dump_frame(surf);
+        Self::stats_tick();
         let t0 = if Self::timing() { Some(std::time::Instant::now()) } else { None };
         unsafe {
             if surf.width != self.tex_w || surf.height != self.tex_h {
@@ -500,9 +501,42 @@ impl Sdl {
         *V.get_or_init(|| std::env::var_os("WA2_TIMING").is_some())
     }
 
+    /// One frame-rate line per second (WA2_STATS=1).
+    ///
+    /// Deliberately not per frame: an `eprintln!` on every present costs
+    /// milliseconds of formatting and a write syscall, which is enough to
+    /// change the number it is measuring. Aggregating over a second keeps the
+    /// probe invisible.
+    fn stats_tick() {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("WA2_STATS").is_some()) {
+            return;
+        }
+        static S: std::sync::Mutex<Option<(u32, std::time::Instant)>> =
+            std::sync::Mutex::new(None);
+        let Ok(mut g) = S.lock() else { return };
+        match g.as_mut() {
+            None => *g = Some((1, std::time::Instant::now())),
+            Some((frames, since)) => {
+                *frames += 1;
+                let elapsed = since.elapsed();
+                if elapsed.as_secs_f32() >= 1.0 {
+                    eprintln!(
+                        "  [stats] {:.1} fps ({} frames in {:.2}s)",
+                        *frames as f32 / elapsed.as_secs_f32(),
+                        *frames,
+                        elapsed.as_secs_f32()
+                    );
+                    *g = Some((0, std::time::Instant::now()));
+                }
+            }
+        }
+    }
+
     /// Upload a raw RGBA buffer (w*h*4 bytes) to the texture and present,
     /// stretched to the window. Used for video frames.
     pub fn present_raw(&mut self, rgba: &[u8], w: u32, h: u32) {
+        Self::stats_tick();
         unsafe {
             if w != self.tex_w || h != self.tex_h {
                 (self.f_destroy_texture)(self.texture);

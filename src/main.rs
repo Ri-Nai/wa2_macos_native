@@ -7182,6 +7182,46 @@ fn draw_menu_labels(
     }
 }
 
+/// Draw the title menu from the pre-rendered label surfaces.
+///
+/// Same geometry as [`draw_menu_labels`], but the outline work already happened
+/// once in [`label_surface`]; here each label is a single blit.
+fn draw_menu_labels_pre(
+    surf: &mut render::Surface,
+    white: &[Option<render::Surface>],
+    gold: &[Option<render::Surface>],
+    sel: usize,
+    x0: i32,
+    y0: i32,
+    item_w: i32,
+    item_h: i32,
+    pitch: i32,
+    ww: i32,
+    wh: i32,
+    stroke: i32,
+) {
+    for i in 0..white.len().max(gold.len()) {
+        let art = if i == sel {
+            gold.get(i).and_then(|a| a.as_ref())
+        } else {
+            white.get(i).and_then(|a| a.as_ref())
+        };
+        let Some(art) = art else { continue };
+        // The surface carries `stroke` pixels of outline on every side, so the
+        // glyph box is that much smaller than the image it was painted into.
+        let glyph_w = art.width as i32 - 2 * stroke;
+        let glyph_h = art.height as i32 - 2 * stroke;
+        let ay = y0 + i as i32 * pitch;
+        let x0w = x0 * ww / 1280;
+        let y0w = ay * wh / 720;
+        let x1w = (x0 + item_w) * ww / 1280;
+        let y1w = (ay + item_h) * wh / 720;
+        let cx = x0w + (x1w - x0w - glyph_w) / 2;
+        let cy = y0w + (y1w - y0w - glyph_h) / 2;
+        surf.blit_surface(art, cx - stroke, cy - stroke);
+    }
+}
+
 /// System-font stand-in for one menu cell. The atlas glyphs are white with a
 /// navy outline `(35, 45, 66)` about two pixels thick. The outline is drawn
 /// first so it surrounds the fill instead of sitting as a drop shadow.
@@ -7228,6 +7268,62 @@ fn blit_tinted_label(
             surf.blend_pixel(x + col, y + row, [rgb[0], rgb[1], rgb[2], a]);
         }
     }
+}
+
+/// Pre-render one menu label, outline included, into its own surface.
+///
+/// `blit_tinted_label` above needs `(2r+1)^2 - 1` blend calls *per glyph pixel*
+/// to grow the navy outline. At a 2560x1440 canvas that is tens of millions of
+/// blends for five labels, and the title screen paid it on every single frame
+/// even though the text only changes when the font size or face does. Doing it
+/// once per label and blitting the result costs about a tenth of a millisecond
+/// per frame instead of eight.
+///
+/// The outline is drawn in the same two passes as the direct path (grow, then
+/// fill on top), so the result is pixel-identical.
+fn label_surface(rgba: &[u8], w: u32, h: u32, rgb: [u8; 3], stroke: i32) -> render::Surface {
+    let r = stroke.max(1);
+    let out_w = w + 2 * r as u32;
+    let out_h = h + 2 * r as u32;
+    let mut surf = render::Surface::new(out_w, out_h, [0, 0, 0, 0]);
+    let outline = [35u8, 45, 66];
+    // Grow: a destination pixel takes the strongest alpha anywhere in reach.
+    for y in 0..out_h as i32 {
+        for x in 0..out_w as i32 {
+            let mut best = 0u8;
+            for dy in -r..=r {
+                let sy = y + dy - r;
+                if sy < 0 || sy >= h as i32 {
+                    continue;
+                }
+                for dx in -r..=r {
+                    let sx = x + dx - r;
+                    if sx < 0 || sx >= w as i32 {
+                        continue;
+                    }
+                    let a = rgba[((sy as u32 * w + sx as u32) * 4) as usize + 3];
+                    if a > best {
+                        best = a;
+                    }
+                }
+            }
+            if best > 0 {
+                surf.blend_pixel(x, y, [outline[0], outline[1], outline[2], best]);
+            }
+        }
+    }
+    // Fill: the glyph itself, inset by the stroke radius.
+    for row in 0..h as i32 {
+        for col in 0..w as i32 {
+            let i = ((row as u32 * w + col as u32) * 4) as usize;
+            let a = rgba[i + 3];
+            if a == 0 {
+                continue;
+            }
+            surf.blend_pixel(col + r, row + r, [rgb[0], rgb[1], rgb[2], a]);
+        }
+    }
+    surf
 }
 
 fn run_special(
@@ -7824,6 +7920,12 @@ fn run_title(
     // restart or a window resize (F-03).
     let mut label_gen = 0u64;
     let mut labels = Vec::new();
+    // The labels pre-rendered with their outline, in both menu colours.
+    // Rebuilding these is the expensive part, so they only follow the font and
+    // the window size - not the frame.
+    let mut label_white: Vec<Option<render::Surface>> = Vec::new();
+    let mut label_gold: Vec<Option<render::Surface>> = Vec::new();
+    let mut label_stroke = 0i32;
     let mut note_px = 0u32;
     let mut note_gen = 0u64;
     let mut note_img: Option<(u32, u32, Vec<u8>)> = None;
@@ -7903,6 +8005,7 @@ fn run_title(
     }
 
     loop {
+        let t_pace = std::time::Instant::now();
         // ---- input (non-blocking so the bar can animate) --------------------
         let mut confirm = false;
         if auto_pick.is_some() {
@@ -7980,10 +8083,23 @@ fn run_title(
         // T0100 draws each label about 29px tall inside the 40px row.
         let ipx = layout_font_px(32, wh);
         let generation = render::text::role_generation();
-        if ipx != label_px || generation != label_gen {
+        let stroke = ((2 * wh) / 720).max(1);
+        if ipx != label_px || generation != label_gen || stroke != label_stroke {
             label_px = ipx;
             label_gen = generation;
+            label_stroke = stroke;
             labels = menu_labels(&items, ipx);
+            let render_all = |rgb: [u8; 3]| -> Vec<Option<render::Surface>> {
+                labels
+                    .iter()
+                    .map(|l| {
+                        l.as_ref()
+                            .map(|(w, h, rgba)| label_surface(rgba, *w, *h, rgb, stroke))
+                    })
+                    .collect()
+            };
+            label_white = render_all([255, 255, 255]);
+            label_gold = render_all([254, 232, 136]);
         }
         if let Some(n) = notice {
             if cn {
@@ -8065,7 +8181,20 @@ fn run_title(
         if !hide_hover_bar {
             paint_bar(&mut frame, fitted, if flashing { 1 } else { 0 }, bar_y, X0);
         }
-        draw_menu_labels(&mut frame, &labels, sel, X0, Y0, ITEM_W, ITEM_H, PITCH, ww, wh);
+        draw_menu_labels_pre(
+            &mut frame,
+            &label_white,
+            &label_gold,
+            sel,
+            X0,
+            Y0,
+            ITEM_W,
+            ITEM_H,
+            PITCH,
+            ww,
+            wh,
+            label_stroke,
+        );
         if notice.is_some() {
             if let Some((rw, rh, rgba)) = note_img.as_ref() {
                 let nx = ww / 2 - *rw as i32 / 2;
@@ -8193,7 +8322,14 @@ fn run_title(
                 _ => notice = Some(notice_text),
             }
         }
-        win.delay(16);
+        // Pace to a 60 Hz target instead of sleeping a flat 16 ms. The compose
+        // work is not constant - the street scroll and the snow keep changing
+        // how much has to be redrawn - and stacking a fixed delay on top of it
+        // made the frame rate depend on the frame's own cost.
+        let budget = std::time::Duration::from_micros(16_667);
+        if let Some(rest) = budget.checked_sub(t_pace.elapsed()) {
+            win.delay(rest.as_millis().min(16) as u32);
+        }
     }
     if let (Some(mx), Some(slot)) = (mixer, bgm_slot.take()) {
         mx.stop(slot);
