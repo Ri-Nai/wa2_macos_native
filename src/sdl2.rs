@@ -94,6 +94,10 @@ pub struct Sdl {
     /// `SDL_GetWindowSizeInPixels` (SDL >= 2.26). Optional: older runtimes and
     /// every non-high-DPI platform keep using `f_get_window_size`.
     f_get_window_size_pixels: Option<unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int)>,
+    /// `SDL_PumpEvents` / `SDL_GetModState`. Optional so an SDL build without
+    /// them only loses the held-Control fast-forward, not the whole game.
+    f_pump_events: Option<unsafe extern "C" fn()>,
+    f_get_mod_state: Option<unsafe extern "C" fn() -> c_int>,
     f_poll_event: unsafe extern "C" fn(*mut c_void) -> c_int,
     f_destroy_texture: unsafe extern "C" fn(*mut c_void),
     f_destroy_renderer: unsafe extern "C" fn(*mut c_void),
@@ -275,6 +279,10 @@ impl Sdl {
         let f_destroy_renderer: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyRenderer")?);
         let f_destroy_window: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(sym(lib, "SDL_DestroyWindow")?);
         let f_delay: unsafe extern "C" fn(u32) = std::mem::transmute(sym(lib, "SDL_Delay")?);
+        let f_pump_events: Option<unsafe extern "C" fn()> =
+            sym(lib, "SDL_PumpEvents").map(|p| std::mem::transmute(p));
+        let f_get_mod_state: Option<unsafe extern "C" fn() -> c_int> =
+            sym(lib, "SDL_GetModState").map(|p| std::mem::transmute(p));
         let f_create_cursor = sym(lib, "SDL_CreateCursor")
             .map(|p| std::mem::transmute(p));
         let f_set_cursor = sym(lib, "SDL_SetCursor")
@@ -389,6 +397,8 @@ impl Sdl {
             f_destroy_renderer,
             f_destroy_window,
             f_delay,
+            f_pump_events,
+            f_get_mod_state,
             f_create_cursor,
             f_set_cursor,
             f_free_cursor,
@@ -489,9 +499,35 @@ impl Sdl {
         else {
             return;
         };
-        let tmp = path.with_extension("tga.tmp");
+        // `WA2_FRAME_DUMP_EVERY=<seconds>` turns this into a timed sample:
+        // a 2560x1440 TGA is 14 MB, so writing every frame stalls the game and
+        // says nothing about what the picture does over 30 seconds.
+        if let Some(secs) = dump_every_secs() {
+            static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                std::sync::Mutex::new(None);
+            let Ok(mut g) = LAST.lock() else { return };
+            let now = std::time::Instant::now();
+            if let Some(t) = *g {
+                let elapsed_ms = now.duration_since(t).as_millis() as u64;
+                if elapsed_ms < secs * 1000 {
+                    return;
+                }
+            }
+            *g = Some(now);
+        }
+        // With a sample interval the frames are numbered; otherwise the file
+        // is overwritten so a debugger can look at "the frame" at any time.
+        let target = if dump_every_secs().is_some() {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+            path.with_file_name(format!("{}-{:04}.tga", stem, n))
+        } else {
+            path.clone()
+        };
+        let tmp = target.with_extension("tga.tmp");
         if surf.save_tga(&tmp.to_string_lossy()).is_ok() {
-            let _ = std::fs::rename(&tmp, path);
+            let _ = std::fs::rename(&tmp, &target);
         }
     }
 
@@ -556,6 +592,25 @@ impl Sdl {
     /// Drain SDL events. A click or key that shares the queue with later mouse
     /// motion is kept: during skip the game spends a long time between polls,
     /// and the motion that follows a click would otherwise replace it.
+    /// Is Control held down right now?
+    ///
+    /// The scene loop reads this to fast-forward while the key is down. It is
+    /// a level, not an event: holding the key has to survive the thousands of
+    /// `poll_input` calls a scene makes, and SDL only reports the transition.
+    pub fn ctrl_held(&self) -> bool {
+        // macOS reports a modifier press as a `flagsChanged` event, not a key
+        // down/up pair, and SDL is the only place that knows how to turn that
+        // into "Control is down". Reading its state also picks up a key that
+        // was already held when the window came forward, which no event of ours
+        // would ever have seen.
+        const KMOD_CTRL: c_int = 0x0040 | 0x0080;
+        let Some(get) = self.f_get_mod_state else { return false };
+        if let Some(pump) = self.f_pump_events {
+            unsafe { pump() };
+        }
+        unsafe { get() & KMOD_CTRL != 0 }
+    }
+
     pub fn poll_input(&mut self) -> Input {
         let mut ev = [0u8; 128];
         let mut out = Input::None;
@@ -657,6 +712,23 @@ impl Sdl {
                         let x = i32::from_ne_bytes([ev[20], ev[21], ev[22], ev[23]]);
                         let y = i32::from_ne_bytes([ev[24], ev[25], ev[26], ev[27]]);
                         out = Input::Release { x, y };
+                    }
+                }
+            }
+        }
+        if out == Input::None {
+            if let Some(ms) = auto_advance_ms() {
+                static LAST: std::sync::Mutex<Option<std::time::Instant>> =
+                    std::sync::Mutex::new(None);
+                if let Ok(mut g) = LAST.lock() {
+                    let now = std::time::Instant::now();
+                    let due = match *g {
+                        Some(t) => now.duration_since(t).as_millis() as u64 >= ms,
+                        None => true,
+                    };
+                    if due {
+                        *g = Some(now);
+                        out = Input::Advance;
                     }
                 }
             }
@@ -1069,4 +1141,27 @@ mod tests {
         assert_ne!(normal, hover);
         assert_ne!(normal, pressed);
     }
+}
+
+/// `WA2_AUTO_ADVANCE=<ms>`: feed an Advance every N ms when nothing else is
+/// pressed. Used to walk a scene without a hand on the mouse while checking
+/// what the compositor does over a long stretch; off unless the variable is set.
+fn auto_advance_ms() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WA2_AUTO_ADVANCE")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+    })
+}
+
+/// `WA2_FRAME_DUMP_EVERY=<seconds>`: sample one frame at that interval.
+fn dump_every_secs() -> Option<u64> {
+    static V: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("WA2_FRAME_DUMP_EVERY")
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+    })
 }

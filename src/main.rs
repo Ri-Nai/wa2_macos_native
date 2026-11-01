@@ -2002,6 +2002,10 @@ fn run_game_at(
     let msg_frame = &rt.msg_frame;
     let mut cmd_auto = false;
     let mut cmd_skip = false;
+    // True while 快进 is only on because Control is held, so releasing the key
+    // can turn it back off without disturbing the sticky 快進 button.
+    let mut skip_by_ctrl = false;
+    let mut ctrl_prev = false;
     // Lines already shown, for the 履历 (backlog) screen.
     let mut backlog: Vec<String> = Vec::new();
     // One snapshot per line the player has been shown, newest last. Rewind
@@ -2754,6 +2758,10 @@ fn run_game_at(
                         let total = std::time::Duration::from_secs_f64(n as f64 / 60.0);
                         let t0 = std::time::Instant::now();
                         while t0.elapsed() < total && !cmd_skip {
+                            // ⌃ cuts the hold short exactly like the 快進
+                            // button does, so a key-held fast-forward is not
+                            // stuck watching a two-second camera pause.
+                            ctrl_skip(win.ctrl_held(), &mut ctrl_prev, &mut cmd_skip, &mut skip_by_ctrl);
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
                                 sdl2::Input::Pointer { x, y, pressed: true } => {
@@ -3379,6 +3387,29 @@ fn run_game_at(
                     let mut cmd_hover: Option<cmdbar::Cmd> = None;
                     let mut dwell: u32 = 0;
                     'wait: loop {
+                            // Holding ⌃ is 快进 for as long as it is down. The
+                            // bar button remains the toggle; see `ctrl_skip`.
+                            match ctrl_skip(win.ctrl_held(), &mut ctrl_prev, &mut cmd_skip, &mut skip_by_ctrl) {
+                                Some(true) => {
+                                    // Same bookkeeping as pressing 快進: the
+                                    // clip for the line on screen stops, and the
+                                    // line it belongs to is remembered so the
+                                    // voice can resume when skip ends.
+                                    window = dialog_open(user_hide);
+                                    if let Some(mx) = mixer.as_ref() {
+                                        stop_voice(mx, &mut voice_stream);
+                                    }
+                                }
+                                Some(false) => {
+                                    window = dialog_open(user_hide);
+                                    if let (Some(mx), Some(vi), Some(cue)) =
+                                        (mixer.as_ref(), voices.as_ref(), skipped_voice.take())
+                                    {
+                                        play_voice(mx, vi, &settings, &mut voice_stream, cue, &current_id);
+                                    }
+                                }
+                                None => {}
+                            }
                             // F-17: the option screen may have changed the
                             // font or the dialogue style. Repaint the line that
                             // is already on screen instead of leaving the old
@@ -5261,6 +5292,52 @@ fn scene_look(settings: &menu::Settings, cg: bool) -> Look {
 
 fn cmd_idle(settings: &menu::Settings) -> u8 {
     (settings.alpha_command.clamp(0, menu::LEVELS) as u32 * 100 / menu::LEVELS as u32) as u8
+}
+
+/// Hold Control to fast-forward, the way a visual novel normally does it.
+///
+/// The engine only ever exposed 快進 as the command-bar button, which is a
+/// sticky toggle: click once to start skipping, click again to stop. The key
+/// has to behave like a *hold* instead, so it is tracked separately from the
+/// button - it turns skip on when the key goes down, and turns it back off
+/// when the key comes up **only if the key was what turned it on**. Toggling
+/// with the button while the key is down, or 「未读文本」 dropping out of skip on
+/// an unseen line, therefore still wins.
+///
+/// Returns `Some(true)` when this call started a skip, `Some(false)` when it
+/// ended one, and `None` when nothing changed - the caller uses that to stop
+/// or resume the voice of the line on screen.
+fn ctrl_skip(
+    down: bool,
+    prev_down: &mut bool,
+    cmd_skip: &mut bool,
+    by_ctrl: &mut bool,
+) -> Option<bool> {
+    // Only the edges do anything. While the key just sits there it must not
+    // take skip back from a click or from 「未读文本」, or the player could not
+    // get out of fast-forward without letting go of the key first.
+    let rising = down && !*prev_down;
+    let falling = !down && *prev_down;
+    *prev_down = down;
+    if rising {
+        // Pressing the key while the button already has skip on just rides
+        // along: the button keeps ownership, so the release does not stop it.
+        if *cmd_skip {
+            return None;
+        }
+        *cmd_skip = true;
+        *by_ctrl = true;
+        return Some(true);
+    }
+    if falling {
+        let owned = *by_ctrl;
+        *by_ctrl = false;
+        if owned && *cmd_skip {
+            *cmd_skip = false;
+            return Some(false);
+        }
+    }
+    None
 }
 
 /// The box is up unless the player hid it. The script no longer folds it:
@@ -9149,5 +9226,62 @@ mod modal_scale_tests {
             assert!(b.0 >= px && b.0 + b.2 <= px + pw, "button leaves the plate");
             assert!(b.1 >= py && b.1 + b.3 <= py + ph, "button leaves the plate");
         }
+    }
+}
+
+#[cfg(test)]
+mod ctrl_skip_tests {
+    use super::ctrl_skip;
+
+    /// One press, one start: the level being polled again must not report a
+    /// second transition, or the caller would stop the voice twice.
+    #[test]
+    fn holding_control_starts_a_skip_once() {
+        let (mut prev, mut skip, mut by) = (false, false, false);
+        assert_eq!(ctrl_skip(true, &mut prev, &mut skip, &mut by), Some(true));
+        assert!(skip && by);
+        for _ in 0..50 {
+            assert_eq!(ctrl_skip(true, &mut prev, &mut skip, &mut by), None);
+        }
+        assert!(skip);
+    }
+
+    /// Letting go ends the skip the key started.
+    #[test]
+    fn releasing_control_ends_the_skip_it_started() {
+        let (mut prev, mut skip, mut by) = (false, false, false);
+        ctrl_skip(true, &mut prev, &mut skip, &mut by);
+        assert_eq!(ctrl_skip(false, &mut prev, &mut skip, &mut by), Some(false));
+        assert!(!skip && !by);
+        // Idle polls are silent.
+        assert_eq!(ctrl_skip(false, &mut prev, &mut skip, &mut by), None);
+    }
+
+    /// 快進 clicked first, key pressed afterwards: the button owns the skip, so
+    /// the release must leave it running.
+    #[test]
+    fn the_button_keeps_ownership() {
+        let (mut prev, mut by) = (false, false);
+        let mut skip = true;
+        assert_eq!(ctrl_skip(true, &mut prev, &mut skip, &mut by), None);
+        assert!(skip && !by);
+        assert_eq!(ctrl_skip(false, &mut prev, &mut skip, &mut by), None);
+        assert!(skip, "releasing the key turned off a button skip");
+    }
+
+    /// A click (or an unseen line) stops skip while the key is still down, and
+    /// holding on must not take it back - otherwise fast-forward could not be
+    /// escaped without letting go of the key first.
+    #[test]
+    fn a_click_during_the_hold_wins() {
+        let (mut prev, mut skip, mut by) = (false, false, false);
+        ctrl_skip(true, &mut prev, &mut skip, &mut by);
+        // The player clicks: the scene loop clears skip itself.
+        skip = false;
+        for _ in 0..20 {
+            assert_eq!(ctrl_skip(true, &mut prev, &mut skip, &mut by), None);
+        }
+        assert!(!skip, "the held key restarted a skip the player stopped");
+        assert_eq!(ctrl_skip(false, &mut prev, &mut skip, &mut by), None);
     }
 }
