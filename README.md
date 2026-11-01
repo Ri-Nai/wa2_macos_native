@@ -198,6 +198,16 @@ WA2_DATA_PROXIES='https://ghfast.top/,https://ghproxy.net/' ./run-mac.sh
 </details>
 
 <details>
+<summary><strong>演出变成纯黑屏 / 背景被一块灰雾盖住？</strong></summary>
+
+两类问题都已修（`3a22a60`、`acd1165`）：
+
+- **卷轴 CG 纯黑**：`ACT227` 原来没有实现，而它要显示的图（`v201900`、`v200000`）有好几屏高，剧本总在这之前先切黑，于是黑屏一直留着。现在按脚本给的帧数把画面向上推过一屏高度，点击可跳过剩余行程。CODA 里春希再次见到和纱的那一段就是它。
+- **背景被遮住 / 像黑屏**：`ACT146/147` 的 `mode >= 0x80` 会选一张 `f0NNN` 图，那些不是背景而是**光效遮罩**（`f0000` 是太阳、`f0046` 是一片光斑、`f0024` 是水面反光），整张 alpha 都是 255、亮度即效果。以前按 alpha 贴图，等于把背景整块换成遮罩；现在改为加算叠加，人物仍然画在它上面。
+
+</details>
+
+<details>
 <summary><strong>BGM 只反复循环开头几秒？</strong></summary>
 
 早期版本会把同一个曲子的 `_A` 变体当作默认，而 `_A` 常常只是整曲的一个短片段（`BGM_001_A` 9 秒，`BGM_001_B` 86 秒；最常用的 1、2、7、41、42 号都如此）。剧本里的 `ACT158` 只带 id / 淡入帧 / 循环 / 音量四个参数，从不指定变体，所以现在由引擎优先选完整版：同名文件 → `_B` → `_A`，音乐模式的可听列表同样是这个顺序。
@@ -281,7 +291,9 @@ cargo test --release
 | `src/ft2.rs` | FreeType 候选加入 `libfreetype.6.dylib` |
 | `src/render/text.rs` | 字体候选改为 macOS 实际存在的字体，跳过 `.LastResort`；优先仓库自带 Noto Sans CJK SC |
 | `src/audio/mixer.rs` | 音频推流改为查 `SDL_GetQueuedAudioSize` 维持约 85 ms 队列，避免 CoreAudio 下欠载产生的卡顿音 |
-| `src/main.rs` | 固定 `delay(16)` 改为补足 16.667 ms 帧预算；UI 音效预解码为 PCM 并复用槽位；菜单标签描边预渲染；模态框按画布倍率绘制；BGM 选完整版 `_B` 而不是短片段 `_A` |
+| `src/main.rs` | 固定 `delay(16)` 改为补足 16.667 ms 帧预算；UI 音效预解码为 PCM 并复用槽位；菜单标签描边预渲染；模态框按画布倍率绘制；BGM 选完整版 `_B` 而不是短片段 `_A`；实现 `ACT227` 卷轴 CG（按帧数向上推过一屏） |
+| `src/vm/lscr.rs` | 新增 `Event::ScrollCg`，从 `ACT227` 的内联参数或其前面那条 K30 记录取出 (id, variant, frames) |
+| `src/render/mod.rs` | `f0NNN` 光效板改为加算（`Surface::add_scaled`），不再是按 alpha 覆盖背景 |
 
 </details>
 
