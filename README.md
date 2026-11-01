@@ -198,6 +198,13 @@ WA2_DATA_PROXIES='https://ghfast.top/,https://ghproxy.net/' ./run-mac.sh
 </details>
 
 <details>
+<summary><strong>BGM 只反复循环开头几秒？</strong></summary>
+
+早期版本会把同一个曲子的 `_A` 变体当作默认，而 `_A` 常常只是整曲的一个短片段（`BGM_001_A` 9 秒，`BGM_001_B` 86 秒；最常用的 1、2、7、41、42 号都如此）。剧本里的 `ACT158` 只带 id / 淡入帧 / 循环 / 音量四个参数，从不指定变体，所以现在由引擎优先选完整版：同名文件 → `_B` → `_A`，音乐模式的可听列表同样是这个顺序。
+
+</details>
+
+<details>
 <summary><strong>我需要先安装 Rust 吗？</strong></summary>
 
 需要 Rust/Cargo 1.90+ 来编译引擎（`rustup` 或 Homebrew 均可）。SDL2、FreeType、ffmpeg 由 Homebrew 提供，`run-mac.sh` 只检查不代装。Python 3 用于素材下载器，macOS 自带的就够。
@@ -274,7 +281,7 @@ cargo test --release
 | `src/ft2.rs` | FreeType 候选加入 `libfreetype.6.dylib` |
 | `src/render/text.rs` | 字体候选改为 macOS 实际存在的字体，跳过 `.LastResort`；优先仓库自带 Noto Sans CJK SC |
 | `src/audio/mixer.rs` | 音频推流改为查 `SDL_GetQueuedAudioSize` 维持约 85 ms 队列，避免 CoreAudio 下欠载产生的卡顿音 |
-| `src/main.rs` | 固定 `delay(16)` 改为补足 16.667 ms 帧预算；UI 音效预解码为 PCM 并复用槽位；菜单标签描边预渲染；模态框按画布倍率绘制 |
+| `src/main.rs` | 固定 `delay(16)` 改为补足 16.667 ms 帧预算；UI 音效预解码为 PCM 并复用槽位；菜单标签描边预渲染；模态框按画布倍率绘制；BGM 选完整版 `_B` 而不是短片段 `_A` |
 
 </details>
 

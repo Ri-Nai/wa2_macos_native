@@ -2795,10 +2795,7 @@ fn run_game_at(
                                         mx.fade(slot, 0.0, if arg(1) == -2 { 15 } else { arg(1) }, true);
                                         fading_bgm = Some(slot);
                                     }
-                                    let dir = root.join("bgm");
-                                    let stem = format!("BGM_{:03}", id);
-                                    let path = [format!("{}.OGG", stem), format!("{}_{}.OGG", stem, if arg(4) != 0 { "B" } else { "A" })]
-                                        .into_iter().map(|name| dir.join(name)).find(|p| p.is_file());
+                                    let path = bgm_file(&root.join("bgm"), id);
                                     if let Some(path) = path {
                                         let slot = mx.play_cat(&path.to_string_lossy(), if arg(1) > 0 { 0.0 } else { volume(arg(3)) }, arg(2) != 0, crate::audio::mixer::CAT_BGM);
                                         if slot != usize::MAX {
@@ -4196,11 +4193,7 @@ fn rewind_step(
             }
             if let Some(id) = dest.bgm {
                 let dir = s.script_dir.parent().unwrap_or(std::path::Path::new(".")).join("bgm");
-                let stem = format!("BGM_{:03}", id);
-                let path = [format!("{}.OGG", stem), format!("{}_A.OGG", stem)]
-                    .into_iter()
-                    .map(|n| dir.join(n))
-                    .find(|p| p.is_file());
+                let path = bgm_file(&dir, id);
                 if let Some(path) = path {
                     let slot = mx.play_cat(&path.to_string_lossy(), 1.0, true, audio::mixer::CAT_BGM);
                     if slot != usize::MAX {
@@ -7737,9 +7730,10 @@ fn run_special(
     }
 }
 
-/// Music mode.  BGM files are indexed by track number; `_A` is preferred
-/// when both internal variants are present because it is the normal in-game
-/// stream.  The player keeps one looping stream alive and never decodes the
+/// Music mode.  BGM files are indexed by track number.  Where a track ships
+/// both arrangements the full `_B` one is listed, since `_A` is often a short
+/// excerpt (`BGM_041_A` is 5 s of an 83 s piece) and a listening room should not
+/// play a clip.  The player keeps one looping stream alive and never decodes the
 /// whole library up front.
 fn run_music(
     win: &mut sdl2::Sdl,
@@ -7763,7 +7757,8 @@ fn run_music(
             let Some(number) = number else { continue };
             let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
             if !ext.eq_ignore_ascii_case("ogg") { continue; }
-            let rank = if low.ends_with("_a") { 0 } else if low.ends_with("_b") { 2 } else { 1 };
+            // Same preference as `bgm_file`: plain name, then `_B`, then `_A`.
+            let rank = if low.ends_with("_a") { 2 } else if low.ends_with("_b") { 1 } else { 0 };
             if choices.get(&number).map(|(old, _)| rank < *old).unwrap_or(true) {
                 choices.insert(number, (rank, path));
             }
@@ -8039,6 +8034,26 @@ impl TitleSnow {
     }
 }
 
+/// The `bgm/` file for a track number, in the order a scene should use it.
+///
+/// Tracks come in two arrangements. `BGM_001_B` is the whole piece (86 s) and
+/// `BGM_001_A` is a short excerpt of it (9 s); the scripts never say which one
+/// they want - every ACT158 call in the corpus carries exactly four ints
+/// (id, fade frames, loop flag, volume) and nothing else - so the choice is the
+/// engine's. Taking `_A` by default played a 5-11 s clip on repeat for the
+/// most-used tracks (1, 2, 7, 41, 42), which is what "the BGM loops the first
+/// few seconds" was; the full arrangement is the one a scene wants.
+///
+/// Some ids ship a single file with no `_A`/`_B` suffix at all, hence the plain
+/// name first, and `_A` stays as the last resort for tracks that only have it.
+fn bgm_file(dir: &std::path::Path, id: i32) -> Option<std::path::PathBuf> {
+    let stem = format!("BGM_{:03}", id);
+    [format!("{}.OGG", stem), format!("{}_B.OGG", stem), format!("{}_A.OGG", stem)]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
 /// The title page music. WA2.exe arms BGM(31, 0, 1, 255, 0, 0) once when the
 /// title screen comes up (call at 0x426701) and the special page re-arms the
 /// same track on entering (0x427611), so one looping stream covers both pages
@@ -8047,6 +8062,9 @@ const TITLE_BGM_ID: i32 = 31;
 
 fn title_bgm_path(bg_dirs: &[&std::path::Path]) -> Option<std::path::PathBuf> {
     let dir = bg_dirs.iter().find_map(|d| d.parent())?.join("bgm");
+    // Both arrangements of track 31 are the same 38 s cue, so the title keeps
+    // the one it has always used; `bgm_file` would pick the other `_B` mix and
+    // change a piece that is not part of the looping problem.
     let stem = format!("BGM_{:03}", TITLE_BGM_ID);
     [format!("{}.OGG", stem), format!("{}_A.OGG", stem)]
         .into_iter()
@@ -9349,5 +9367,59 @@ mod scene_cache_tests {
         assert_eq!(art_id(&bg), art_id(&bg));
         let same_content = picture(7);
         assert_ne!(art_id(&bg), art_id(&same_content), "two buffers are two pictures");
+    }
+}
+
+mod bgm_variant_tests {
+    use super::bgm_file;
+    use std::path::PathBuf;
+
+    struct TempTree(PathBuf);
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn tree(tag: &str, files: &[&str]) -> TempTree {
+        let dir = std::env::temp_dir().join(format!("wa2-bgm-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in files {
+            std::fs::write(dir.join(f), b"").unwrap();
+        }
+        TempTree(dir)
+    }
+
+    fn name(dir: &TempTree, id: i32) -> Option<String> {
+        bgm_file(&dir.0, id)
+            .and_then(|p| p.file_name().map(|f| f.to_string_lossy().into_owned()))
+    }
+
+    /// `_A` is an excerpt for most tracks (BGM_001_A is 9 s against B's 86 s),
+    /// and the scripts carry no variant flag, so picking it by default looped a
+    /// few seconds of music forever. The full arrangement has to win.
+    #[test]
+    fn the_full_arrangement_wins_over_the_short_one() {
+        let d = tree("both", &["BGM_001_A.OGG", "BGM_001_B.OGG"]);
+        assert_eq!(name(&d, 1).as_deref(), Some("BGM_001_B.OGG"));
+    }
+
+    #[test]
+    fn an_unsuffixed_track_is_used_as_shipped() {
+        let d = tree("plain", &["BGM_004.OGG"]);
+        assert_eq!(name(&d, 4).as_deref(), Some("BGM_004.OGG"));
+    }
+
+    #[test]
+    fn a_track_with_only_the_excerpt_still_plays() {
+        let d = tree("aonly", &["BGM_050_A.OGG"]);
+        assert_eq!(name(&d, 50).as_deref(), Some("BGM_050_A.OGG"));
+    }
+
+    #[test]
+    fn a_missing_track_is_reported_as_missing() {
+        let d = tree("none", &["BGM_004.OGG"]);
+        assert_eq!(name(&d, 7), None);
     }
 }
