@@ -935,6 +935,33 @@ fn effect_name(mode: i32) -> Option<String> {
     (mode >= 0x80).then(|| format!("f0{:03}.bmp", mode & 0x7f))
 }
 
+/// What an ACT146/147 background id asks the scene to do.
+///
+/// The scripts use three kinds of id and they look alike in the bytecode:
+///
+/// * `0` is a scripted cut to black - the shot is over and everybody in it
+///   leaves.
+/// * a negative id (only `-2` occurs, 736 times in the corpus) is the
+///   "re-composite the shot you are already showing" sentinel. It is
+///   emitted right in front of a `spr Enter`, between a picture and the
+///   same picture again with one more person standing in it. Treating it as
+///   a black screen is what used to paint the cast on solid black.
+/// * anything else is a picture id to look up.
+#[derive(Debug, PartialEq, Eq)]
+enum BgRequest {
+    Black,
+    Keep,
+    Picture,
+}
+
+fn bg_request(id: i64) -> BgRequest {
+    match id {
+        0 => BgRequest::Black,
+        i if i < 0 => BgRequest::Keep,
+        _ => BgRequest::Picture,
+    }
+}
+
 fn background_override_name(id: i64, variant: u32, preset: i32) -> String {
     format!("b{:04}{}{}.amp", id, variant, preset.clamp(0, 9))
 }
@@ -2584,67 +2611,80 @@ fn run_game_at(
                     win.present(&cur_surf);
                 }
                 vm::lscr::Event::BgScene { id, variant, frames, mode } => {
-                    // ACT146/147. id 0 and -2 are a scripted black screen.
-                    // A missing file keeps the picture already on screen.
+                    // ACT146/147. id 0 is a scripted black screen. A negative
+                    // id is not a picture at all - see below. A missing file
+                    // keeps the picture already on screen.
                     let old = clone_surf(&cur_surf);
                     effect_mode = mode;
                     effect = load_effect(&s.bg_dirs(), effect_mode);
-                    if id == 0 || id == -2 {
-                        plates.clear();
-                        bg_cg = false;
-                        bg_id = None;
-                        bg_label = "BLACK".to_string();
-                        bg = solid_bg(W, H, [0, 0, 0]);
-                        bg_scale = None;
-                        bg_src_scale = None;
-                        // id 0 is a fade-out: the shot is over, so the people
-                        // from it must leave. id -2 keeps whoever is standing
-                        // (the cut to black in 1010 still has them in frame).
-                        // Without this, 依緒 and 雪菜 stay on screen through the
-                        // whole rest of 1012_030, including the park and the
-                        // narration that is only about かずさ.
-                        if id == 0 {
-                            slots = Default::default();
+                    match bg_request(id) {
+                        BgRequest::Keep => {
+                            // The negative sentinel: re-composite the shot
+                            // that is already on screen. See `bg_request`.
+                            eprintln!(
+                                "scene {} | bg unchanged (script id {} fade {}f)",
+                                current_id, id, frames
+                            );
                         }
-                        eprintln!(
-                            "scene {} | bg BLACK (script id {} fade {}f)",
-                            current_id, id, frames
-                        );
-                    } else if let Some(name) = s.bg_index.resolve(id, variant) {
-                        if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
+                        BgRequest::Black => {
                             plates.clear();
-                            bg_cg = name.starts_with('v') || name.starts_with('V');
-                            bg_id = Some((id, variant));
-                            bg_label = name.clone();
-                            bg_scale = Some(asset.art_scale);
-                    bg_src_scale = Some(asset.src_scale);
-                            bg = asset.img;
+                            bg_cg = false;
+                            bg_id = None;
+                            bg_label = "BLACK".to_string();
+                            bg = solid_bg(W, H, [0, 0, 0]);
+                            bg_scale = None;
+                            bg_src_scale = None;
+                            // id 0 is a fade-out: the shot is over, so the
+                            // people from it must leave. Without this, 依緒 and
+                            // 雪菜 stay on screen through the whole rest of
+                            // 1012_030, including the park and the narration
+                            // that is only about かずさ.
+                            slots = Default::default();
                             eprintln!(
-                                "scene {} | bg {} id={} var={} fade={}f",
-                                current_id, name, id, variant, frames
-                            );
-                            // Per-background ambient override: the exe uses
-                            // the background id, its one-digit variant, and
-                            // the active ACT170 preset as three separate
-                            // sprintf arguments (`b{ID}{digit}{preset}.amp`).
-                            let ov = background_override_name(id, variant, ambient_preset_id);
-                            if load_tint(&s.bg_dirs(), &ov).is_some() {
-                                eprintln!("  ambient: bg override {}", ov);
-                                ambient_override = Some(ov);
-                            } else {
-                                ambient_override = None;
-                            }
-                        } else {
-                            eprintln!(
-                                "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
-                                current_id, id, variant, name, bg_label
+                                "scene {} | bg BLACK (script id {} fade {}f)",
+                                current_id, id, frames
                             );
                         }
-                    } else {
-                        eprintln!(
-                            "scene {} | bg MISSING id={} var={}, screen stays {}",
-                            current_id, id, variant, bg_label
-                        );
+                        BgRequest::Picture => {
+                            if let Some(name) = s.bg_index.resolve(id, variant) {
+                                if let Some(asset) = load_background_asset(&s.bg_dirs(), &name) {
+                                    plates.clear();
+                                    bg_cg = name.starts_with('v') || name.starts_with('V');
+                                    bg_id = Some((id, variant));
+                                    bg_label = name.clone();
+                                    bg_scale = Some(asset.art_scale);
+                                    bg_src_scale = Some(asset.src_scale);
+                                    bg = asset.img;
+                                    eprintln!(
+                                        "scene {} | bg {} id={} var={} fade={}f",
+                                        current_id, name, id, variant, frames
+                                    );
+                                    // Per-background ambient override: the exe
+                                    // uses the background id, its one-digit
+                                    // variant, and the active ACT170 preset as
+                                    // three separate sprintf arguments
+                                    // (`b{ID}{digit}{preset}.amp`).
+                                    let ov =
+                                        background_override_name(id, variant, ambient_preset_id);
+                                    if load_tint(&s.bg_dirs(), &ov).is_some() {
+                                        eprintln!("  ambient: bg override {}", ov);
+                                        ambient_override = Some(ov);
+                                    } else {
+                                        ambient_override = None;
+                                    }
+                                } else {
+                                    eprintln!(
+                                        "scene {} | bg id={} var={} file {} FAILED to decode, screen stays {}",
+                                        current_id, id, variant, name, bg_label
+                                    );
+                                }
+                            } else {
+                                eprintln!(
+                                    "scene {} | bg MISSING id={} var={}, screen stays {}",
+                                    current_id, id, variant, bg_label
+                                );
+                            }
+                        }
                     }
                     line_base = None;
                     line_done = true;
@@ -9515,5 +9555,30 @@ mod bgm_variant_tests {
     fn a_missing_track_is_reported_as_missing() {
         let d = tree("none", &["BGM_004.OGG"]);
         assert_eq!(name(&d, 7), None);
+    }
+}
+
+#[cfg(test)]
+mod bg_request_tests {
+    use super::{bg_request, BgRequest};
+
+    /// `0` is the only id that cuts to black.
+    #[test]
+    fn zero_cuts_to_black() {
+        assert_eq!(bg_request(0), BgRequest::Black);
+    }
+
+    /// The negative sentinel stands in front of every `spr Enter`. Reading it
+    /// as "black" is what painted the cast on a solid black fill whenever a
+    /// second person joined the shot.
+    #[test]
+    fn the_negative_sentinel_keeps_the_picture() {
+        assert_eq!(bg_request(-2), BgRequest::Keep);
+    }
+
+    #[test]
+    fn a_real_id_wants_a_picture() {
+        assert_eq!(bg_request(1007), BgRequest::Picture);
+        assert_eq!(bg_request(1), BgRequest::Picture);
     }
 }
