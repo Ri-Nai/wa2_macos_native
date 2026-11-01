@@ -4263,8 +4263,21 @@ enum CmdOutcome {
     Quit,
 }
 
+/// How much bigger the canvas is than the 1280x720 design space the UI sheets
+/// were authored in. A Retina canvas (2560x1440) is exactly 2; a 1x window is
+/// 1, which keeps every 1280x720 frame pixel-identical to before.
+fn ui_scale(w: u32, h: u32) -> f32 {
+    (w as f32 / render::LAYOUT_W as f32)
+        .min(h as f32 / render::LAYOUT_H as f32)
+        .clamp(0.5, 4.0)
+}
+
 fn centered_plate(w: i32, h: i32) -> (i32, i32) {
-    ((1280 - w) / 2, (720 - h) / 2)
+    centered_plate_in(render::LAYOUT_W, render::LAYOUT_H, w, h)
+}
+
+fn centered_plate_in(cw: u32, ch: u32, w: i32, h: i32) -> (i32, i32) {
+    (((cw as i32) - w) / 2, ((ch as i32) - h) / 2)
 }
 
 fn in_box(sx: i32, sy: i32, b: (i32, i32, i32, i32)) -> bool {
@@ -4272,18 +4285,28 @@ fn in_box(sx: i32, sy: i32, b: (i32, i32, i32, i32)) -> bool {
 }
 
 /// Yes on the left, no on the right, along the bottom of the confirm plate.
-fn ask_buttons(px: i32, py: i32, pw: i32, ph: i32) -> [(i32, i32, i32, i32); 2] {
-    let bw = 160;
-    let bh = 40;
+/// `k` keeps the row's proportions on a canvas that is not 1280x720.
+fn ask_buttons(px: i32, py: i32, pw: i32, ph: i32, k: f32) -> [(i32, i32, i32, i32); 2] {
+    let bw = (160.0 * k).round() as i32;
+    let bh = (40.0 * k).round() as i32;
+    let pad = (28.0 * k).round() as i32;
     let x = px + (pw - bw * 2) / 2;
-    let y = py + ph - bh - 28;
+    let y = py + ph - bh - pad;
     [(x, y, bw, bh), (x + bw, y, bw, bh)]
 }
 
-fn blit_line(surf: &mut render::Surface, text: Option<&(u32, u32, Vec<u8>)>, px: i32, py: i32, pw: i32, ph: i32) {
+fn blit_line(
+    surf: &mut render::Surface,
+    text: Option<&(u32, u32, Vec<u8>)>,
+    px: i32,
+    py: i32,
+    pw: i32,
+    ph: i32,
+    k: f32,
+) {
     if let Some((tw, th, rgba)) = text {
         let x = px + (pw - *tw as i32) / 2;
-        let y = py + (ph - *th as i32) / 2 - 8;
+        let y = py + (ph - *th as i32) / 2 - (8.0 * k).round() as i32;
         surf.blit_rgba(rgba, *tw, *th, x.max(px + 8), y.max(py + 8));
     }
 }
@@ -4293,50 +4316,72 @@ fn paint_toast(
     plate: Option<&codec::tga::TgaImage>,
     text: Option<&(u32, u32, Vec<u8>)>,
 ) -> render::Surface {
+    let k = ui_scale(frame.width, frame.height);
     let mut s = clone_surf(frame);
     s.dim(110);
     let (pw, ph) = plate
         .map(|p| (p.width as i32, p.height as i32))
         .unwrap_or((480, 112));
-    let (px, py) = centered_plate(pw, ph);
+    let (pw, ph) = ((pw as f32 * k).round() as i32, (ph as f32 * k).round() as i32);
+    let (px, py) = centered_plate_in(s.width, s.height, pw, ph);
     if let Some(p) = plate {
-        s.blit(p, px, py);
+        s.blit_region_scaled(p, 0, 0, p.width, p.height, px, py, pw as u32, ph as u32, 255);
     } else {
         s.fill_rect(px, py, pw as u32, ph as u32, [16, 90, 104, 255]);
     }
-    blit_line(&mut s, text, px, py, pw, ph);
+    blit_line(&mut s, text, px, py, pw, ph, k);
+    s
+}
+
+/// The dimmed still a modal is composited on. Built once per prompt: dimming a
+/// 2560x1440 frame every 16 ms to follow the mouse is not affordable.
+fn modal_backdrop(frame: &render::Surface, amount: u8) -> render::Surface {
+    let mut s = clone_surf(frame);
+    s.dim(amount);
     s
 }
 
 fn paint_confirm(
-    frame: &render::Surface,
+    backdrop: &render::Surface,
     plate: Option<&codec::tga::TgaImage>,
     buttons: Option<&codec::tga::TgaImage>,
     text: Option<&(u32, u32, Vec<u8>)>,
     hover: Option<bool>,
 ) -> render::Surface {
-    let mut s = clone_surf(frame);
-    s.dim(140);
+    let k = ui_scale(backdrop.width, backdrop.height);
+    let mut s = clone_surf(backdrop);
     let (pw, ph) = plate
         .map(|p| (p.width as i32, p.height as i32))
         .unwrap_or((544, 216));
-    let (px, py) = centered_plate(pw, ph);
+    let (pw, ph) = ((pw as f32 * k).round() as i32, (ph as f32 * k).round() as i32);
+    let (px, py) = centered_plate_in(s.width, s.height, pw, ph);
     if let Some(p) = plate {
-        s.blit(p, px, py);
+        s.blit_region_scaled(p, 0, 0, p.width, p.height, px, py, pw as u32, ph as u32, 255);
     } else {
         s.fill_rect(px, py, pw as u32, ph as u32, [16, 90, 104, 255]);
     }
     // The prompt sits in the upper half; the 是/否 row owns the bottom.
     if let Some((tw, th, rgba)) = text {
         let x = px + (pw - *tw as i32) / 2;
-        s.blit_rgba(rgba, *tw, *th, x.max(px + 16), py + 48);
+        s.blit_rgba(rgba, *tw, *th, x.max(px + 16), py + (48.0 * k).round() as i32);
     }
     if let Some(img) = buttons {
-        let boxes = ask_buttons(px, py, pw, ph);
+        let boxes = ask_buttons(px, py, pw, ph, k);
         for (i, rect) in boxes.iter().enumerate() {
             let hot = hover == Some(i == 0);
             let row = if hot { 1 } else { 0 };
-            s.blit_region(img, (i as i32) * 160, row * 40, 160, 40, rect.0, rect.1);
+            s.blit_region_scaled(
+                img,
+                (i as i32) * 160,
+                row * 40,
+                160,
+                40,
+                rect.0,
+                rect.1,
+                rect.2 as u32,
+                rect.3 as u32,
+                255,
+            );
         }
     }
     s
@@ -4351,7 +4396,8 @@ fn show_toast(
     message: &str,
 ) -> bool {
     let plate = load_background(dirs, "sys_00110.tga");
-    let text = render::text::with_ui_font(22, |f| f.line_rgba(message, 22)).flatten();
+    let size = (22.0 * ui_scale(frame.width, frame.height)).round().max(12.0) as u32;
+    let text = render::text::with_ui_font(size, |f| f.line_rgba(message, size)).flatten();
     let surf = paint_toast(frame, plate.as_ref(), text.as_ref());
     win.present(&surf);
     let t0 = std::time::Instant::now();
@@ -4379,13 +4425,20 @@ fn ask_yes_no(
 ) -> Option<bool> {
     let plate = load_background(dirs, "sys_00100.tga");
     let buttons = load_background(dirs, "sys_00101.tga");
-    let text = render::text::with_ui_font(22, |f| f.line_rgba(message, 22)).flatten();
+    // The prompt follows the canvas, not the 1280x720 design space: on a
+    // Retina frame both the plate and the glyphs are drawn at twice the size
+    // instead of being upscaled afterwards.
+    let k = ui_scale(frame.width, frame.height);
+    let size = (22.0 * k).round().max(12.0) as u32;
+    let text = render::text::with_ui_font(size, |f| f.line_rgba(message, size)).flatten();
     let (pw, ph) = plate
         .as_ref()
         .map(|p| (p.width as i32, p.height as i32))
         .unwrap_or((544, 216));
-    let (px, py) = centered_plate(pw, ph);
-    let boxes = ask_buttons(px, py, pw, ph);
+    let (pw, ph) = ((pw as f32 * k).round() as i32, (ph as f32 * k).round() as i32);
+    let (px, py) = centered_plate_in(frame.width, frame.height, pw, ph);
+    let boxes = ask_buttons(px, py, pw, ph, k);
+    let backdrop = modal_backdrop(frame, 140);
     let mut mx = -1i32;
     let mut my = -1i32;
     loop {
@@ -4396,7 +4449,7 @@ fn ask_yes_no(
         } else {
             None
         };
-        let surf = paint_confirm(frame, plate.as_ref(), buttons.as_ref(), text.as_ref(), hover);
+        let surf = paint_confirm(&backdrop, plate.as_ref(), buttons.as_ref(), text.as_ref(), hover);
         win.present(&surf);
         match win.poll_input() {
             sdl2::Input::Quit => {
@@ -4412,7 +4465,7 @@ fn ask_yes_no(
                 return Some(true);
             }
             sdl2::Input::Pointer { x, y, pressed } => {
-                let (sx, sy) = win.surface_pos(x, y, 1280, 720);
+                let (sx, sy) = win.surface_pos(x, y, frame.width, frame.height);
                 mx = sx;
                 my = sy;
                 if pressed {
@@ -8454,12 +8507,15 @@ fn play_movie(
                 | sdl2::Input::RightClick
                 | sdl2::Input::Choice(_)
                 | sdl2::Input::Pointer { pressed: true, .. } => {
+                    // The still the prompt is drawn on keeps the movie's own
+                    // pixels. Downscaling it to 1280x720 first made the whole
+                    // picture - and the prompt's text - drop to half
+                    // resolution for as long as the dialog was up.
                     let snapshot = render::Surface {
                         width: movie.width,
                         height: movie.height,
                         pixels: frame.clone(),
-                    }
-                    .scaled_to(1280, 720);
+                    };
                     let message = if std::env::var_os("WA2_LANG").as_deref() == Some(std::ffi::OsStr::new("jp")) {
                         "ムービーをスキップしますか？"
                     } else {
@@ -8858,17 +8914,23 @@ mod backlog_paint {
             std::path::Path::new("/home/lrxin/wa2-native/data/bg_cn"),
             std::path::Path::new("/home/lrxin/wa2-native/data/bg"),
         ];
-        let plate = super::load_background(&dirs, "sys_00100.tga").unwrap();
-        let buttons = super::load_background(&dirs, "sys_00101.tga").unwrap();
+        let (Some(plate), Some(buttons)) = (
+            super::load_background(&dirs, "sys_00100.tga"),
+            super::load_background(&dirs, "sys_00101.tga"),
+        ) else {
+            // No art tree at that path (e.g. a macOS checkout): nothing to check.
+            return;
+        };
         let scene = crate::render::Surface::new(1280, 720, [20, 20, 20, 255]);
         let text = crate::render::text::with_ui_font(22, |f| {
             f.line_rgba("要读取快速存档吗？", 22)
         })
         .flatten();
         assert!(text.is_some(), "system font should rasterize the prompt");
-        let surf = super::paint_confirm(&scene, Some(&plate), Some(&buttons), text.as_ref(), Some(true));
+        let backdrop = super::modal_backdrop(&scene, 140);
+        let surf = super::paint_confirm(&backdrop, Some(&plate), Some(&buttons), text.as_ref(), Some(true));
         let (px, py) = super::centered_plate(plate.width as i32, plate.height as i32);
-        let boxes = super::ask_buttons(px, py, plate.width as i32, plate.height as i32);
+        let boxes = super::ask_buttons(px, py, plate.width as i32, plate.height as i32, 1.0);
         let sample = |x: i32, y: i32| {
             let i = ((y as u32 * 1280 + x as u32) * 4) as usize;
             surf.pixels[i] as u16 + surf.pixels[i + 1] as u16 + surf.pixels[i + 2] as u16
@@ -9052,5 +9114,40 @@ mod ambient_tint_tests {
         assert_eq!(effect_name(0xA1).as_deref(), Some("f0033.bmp"));
         assert_eq!(effect_name(1), None);
         assert_eq!(ambient_preset_name(3).as_deref(), Some("indoor.amp"));
+    }
+}
+
+#[cfg(test)]
+mod modal_scale_tests {
+    use super::*;
+
+    /// 1x stays 1x: the modal must not move on a 1280x720 canvas.
+    #[test]
+    fn the_prompt_keeps_its_position_at_one_x() {
+        assert_eq!(ui_scale(1280, 720), 1.0);
+        assert_eq!(centered_plate(544, 216), centered_plate_in(1280, 720, 544, 216));
+        let (px, py) = centered_plate(544, 216);
+        let boxes = ask_buttons(px, py, 544, 216, 1.0);
+        assert_eq!((boxes[0].2, boxes[0].3), (160, 40));
+        assert_eq!(boxes[1].0, boxes[0].0 + 160);
+    }
+
+    /// A Retina frame gets a plate at twice the logical size, centred, with the
+    /// yes/no row still inside it - this is what the movie skip prompt needs.
+    #[test]
+    fn the_prompt_follows_a_retina_canvas() {
+        let k = ui_scale(2560, 1440);
+        assert_eq!(k, 2.0);
+        let (pw, ph) = ((544.0 * k).round() as i32, (216.0 * k).round() as i32);
+        let (px, py) = centered_plate_in(2560, 1440, pw, ph);
+        assert_eq!((px, py), (2560 / 2 - 544, 1440 / 2 - 216));
+        assert!(px > 0 && py > 0 && px + pw < 2560 && py + ph < 1440);
+        let boxes = ask_buttons(px, py, pw, ph, k);
+        assert_eq!((boxes[0].2, boxes[0].3), (320, 80));
+        assert_eq!(boxes[1].0, boxes[0].0 + 320);
+        for b in boxes {
+            assert!(b.0 >= px && b.0 + b.2 <= px + pw, "button leaves the plate");
+            assert!(b.1 >= py && b.1 + b.3 <= py + ph, "button leaves the plate");
+        }
     }
 }
