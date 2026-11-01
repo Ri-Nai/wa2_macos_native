@@ -1,0 +1,42 @@
+#!/bin/bash
+# Launch wrapper for the White Album 2 native engine.
+#
+# Finder starts an .app with an arbitrary working directory and NO terminal, so
+# this wrapper has to do three things the shell script alone does not:
+#   * cd into the project root (run-mac.sh resolves data/ and target/ relative
+#     to itself, and cargo needs to find Cargo.toml);
+#   * keep stdout/stderr somewhere readable, because a double-click failure is
+#     otherwise completely silent;
+#   * surface a real dialog when it fails, instead of the app bouncing and
+#     disappearing.
+set -uo pipefail
+
+# Finder launches an app with PATH=/usr/bin:/bin:/usr/sbin:/sbin only. Without
+# Homebrew on PATH everything downstream breaks - `brew list` reports nothing
+# installed and `ffmpeg`/`ffprobe` look absent even though they are right there.
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$HOME/.cargo/bin:$PATH"
+
+ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../../.." && pwd)"
+LOG="$HOME/Library/Logs/WhiteAlbum2.log"
+mkdir -p "$(dirname "$LOG")"
+
+fail() {
+    printf '\n[%s] %s\n' "$(date '+%F %T')" "$1" >>"$LOG"
+    /usr/bin/osascript -e "display dialog \"$1\" with title \"White Album 2\" buttons {\"好\"} default button 1 with icon caution" >/dev/null 2>&1
+    exit 1
+}
+
+cd "$ROOT" || fail "找不到项目目录：$ROOT"
+
+{
+    printf '\n===== %s =====\n' "$(date '+%F %T')"
+    echo "root: $ROOT"
+} >>"$LOG"
+
+./run-mac.sh "$@" >>"$LOG" 2>&1
+status=$?
+
+# 0 is a clean exit (the player chose 结束游戏); anything else is worth saying.
+if [ "$status" -ne 0 ]; then
+    fail "引擎退出，代码 $status。详情：$LOG"
+fi
