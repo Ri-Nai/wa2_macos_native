@@ -34,9 +34,19 @@ case "${1:-}" in
 esac
 
 missing=()
-for lib in sdl2 freetype ffmpeg; do
-  brew list --versions "$lib" >/dev/null 2>&1 || missing+=("$lib")
-done
+# Probe the libraries themselves rather than asking Homebrew: this script also
+# runs from a Finder double-click, where `brew` is not on PATH and `brew list`
+# would report every package missing on a machine that has all of them.
+lib_present() {
+  local name="$1" prefix
+  for prefix in /opt/homebrew /usr/local /opt/local; do
+    [ -e "$prefix/lib/$name" ] && return 0
+  done
+  return 1
+}
+lib_present libSDL2-2.0.0.dylib || missing+=("sdl2")
+lib_present libfreetype.6.dylib || missing+=("freetype")
+command -v ffmpeg >/dev/null 2>&1 || [ -x /opt/homebrew/bin/ffmpeg ] || [ -x /usr/local/bin/ffmpeg ] || missing+=("ffmpeg")
 if [ ${#missing[@]} -gt 0 ]; then
   echo "缺少 Homebrew 依赖：${missing[*]}"
   echo "请先运行：brew install ${missing[*]}"
