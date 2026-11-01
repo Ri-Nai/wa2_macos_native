@@ -3691,8 +3691,18 @@ pub fn run(
     st: &mut Settings,
     mx: Option<&crate::audio::mixer::Mixer>,
     ui: Option<&crate::UiSound>,
+    // The picture the option screen opens over. Every page sheet is ~60%
+    // opaque dark glass (`sys_0310X` averages alpha 154), so the game's own
+    // compositor put it on top of whatever was on screen: the standing scene,
+    // or the title page. Painting it over a black surface instead turned the
+    // whole screen into a black plate with a few teal rims on it.
+    backdrop: Option<&Surface>,
 ) {
     let assets = Assets::load(dirs);
+    // The sheets above are laid out in the 1280x720 design space, so the
+    // backdrop is brought to that size once and blitted under them every
+    // frame; the finished frame is scaled back up to the window at the end.
+    let underlay: Option<Surface> = backdrop.map(|b| b.scaled_to(W, H));
     if !assets.available() {
         eprintln!("menu: option screen artwork missing, cannot open");
         return;
@@ -4077,7 +4087,12 @@ pub fn run(
                     menu_text = build_menu_text(scr.page, ww, wh);
                 }
             }
-            let mut s = Surface::new(W, H, [0, 0, 0, 255]);
+            let mut s = match underlay.as_ref() {
+                // The page art is dark glass; what shows through it is the
+                // picture the option screen was opened over.
+                Some(u) => Surface { width: u.width, height: u.height, pixels: u.pixels.clone() },
+                None => Surface::new(W, H, [0, 0, 0, 255]),
+            };
             compose(&mut s, &assets, st, &scr);
             if cn && menu_text.is_some() {
                 s.fill_rect(GUIDE_X, guide_y(scr.page), GUIDE_W as u32, GUIDE_H as u32, [0, 0, 0, 255]);

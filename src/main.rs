@@ -4645,7 +4645,7 @@ fn handle_cmd(
             let mut st = menu::Settings::load();
             let dirs = s.bg_dirs();
             let ui = UiSound::resolve(&dirs);
-            menu::run(win, &dirs, &mut st, mixer, Some(&ui));
+            menu::run(win, &dirs, &mut st, mixer, Some(&ui), Some(frame));
             *settings = menu::Settings::load();
             menu::apply(settings, mixer);
             refresh_dialog_font(s.cn, vfont.as_deref_mut());
@@ -5560,6 +5560,29 @@ fn hash_u64(state: &mut u64, value: u64) {
     *state = (*state ^ value).wrapping_mul(0x100_0000_01b3);
 }
 
+/// Identity of a decoded picture for the scene cache.
+///
+/// The allocation address on its own is not an identity. When a background is
+/// dropped - every scripted cut to black does exactly that - its buffer goes
+/// back to the allocator, and the next decode of the same size usually lands
+/// on that same address. The cache then compares equal, decides nothing has
+/// changed, and keeps serving the previous picture; that is how a black frame
+/// could survive the cut back into a scene. Mixing a few sampled pixels into
+/// the hash makes the identity follow the content instead.
+fn art_id(img: &codec::tga::TgaImage) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    hash_u64(&mut h, img.rgba.as_ptr() as usize as u64);
+    hash_u64(&mut h, img.rgba.len() as u64);
+    let n = img.rgba.len();
+    if n != 0 {
+        for i in 0..64u64 {
+            let at = ((i * 7919 + 13) as usize) % n;
+            hash_u64(&mut h, img.rgba[at] as u64);
+        }
+    }
+    h
+}
+
 fn scene_art_key(
     bg: &codec::tga::TgaImage,
     effect: Option<&codec::tga::TgaImage>,
@@ -5574,13 +5597,13 @@ fn scene_art_key(
     h: u32,
 ) -> u64 {
     let mut key = 0xcbf2_9ce4_8422_2325u64;
-    hash_u64(&mut key, bg.rgba.as_ptr() as usize as u64);
+    hash_u64(&mut key, art_id(bg));
     hash_u64(&mut key, bg.width as u64);
-    hash_u64(&mut key, effect.map(|e| e.rgba.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, effect.map(art_id).unwrap_or(0));
     hash_u64(&mut key, effect.map(|e| e.width as u64).unwrap_or(0));
     hash_u64(&mut key, effect.map(|e| e.height as u64).unwrap_or(0));
     for sp in draws {
-        hash_u64(&mut key, sp.img.rgba.as_ptr() as usize as u64);
+        hash_u64(&mut key, art_id(sp.img));
         hash_u64(&mut key, sp.logical_w as u64);
         hash_u64(&mut key, sp.x as u64);
         hash_u64(&mut key, sp.y as u64);
@@ -5589,12 +5612,12 @@ fn scene_art_key(
     hash_u64(&mut key, tint.map(|t| t.as_ptr() as usize as u64).unwrap_or(0));
     hash_u64(&mut key, tint.map(|t| t.len() as u64).unwrap_or(0));
     hash_u64(&mut key, window as u64);
-    hash_u64(&mut key, plate.map(|p| p.rgba.as_ptr() as usize as u64).unwrap_or(0));
-    hash_u64(&mut key, frame.map(|p| p.rgba.as_ptr() as usize as u64).unwrap_or(0));
+    hash_u64(&mut key, plate.map(art_id).unwrap_or(0));
+    hash_u64(&mut key, frame.map(art_id).unwrap_or(0));
     hash_u64(&mut key, look.alpha as u64);
     hash_u64(&mut key, look.shade as u64);
     for (img, x, y, scale) in overlays {
-        hash_u64(&mut key, img.rgba.as_ptr() as usize as u64);
+        hash_u64(&mut key, art_id(img));
         hash_u64(&mut key, *x as u64);
         hash_u64(&mut key, *y as u64);
         hash_u64(&mut key, *scale as u64);
@@ -8433,7 +8456,7 @@ fn run_title(
                     // 「系统设置」: the game's own option screen.
                     let mut st = menu::Settings::load();
                     menu::apply(&st, None);
-                    menu::run(win, bg_dirs, &mut st, mixer, Some(&ui));
+                    menu::run(win, bg_dirs, &mut st, mixer, Some(&ui), Some(&frame));
                     win.set_fullscreen(st.win_disp == 1);
                     set_render_art_scale(win);
                     notice = None;
@@ -9283,5 +9306,48 @@ mod ctrl_skip_tests {
         }
         assert!(!skip, "the held key restarted a skip the player stopped");
         assert_eq!(ctrl_skip(false, &mut prev, &mut skip, &mut by), None);
+    }
+}
+#[cfg(test)]
+mod scene_cache_tests {
+    use super::art_id;
+    use crate::codec::tga::TgaImage;
+
+    fn picture(seed: u8) -> TgaImage {
+        let mut rgba = vec![0u8; 64 * 64 * 4];
+        for (i, p) in rgba.iter_mut().enumerate() {
+            *p = (i as u8).wrapping_mul(31).wrapping_add(seed);
+        }
+        TgaImage { width: 64, height: 64, rgba }
+    }
+
+    /// The scene cache compares identities, and an identity has to follow the
+    /// picture. Keyed on the allocation address alone, a background that was
+    /// dropped (every scripted cut to black drops one) freed its buffer, the
+    /// next decode of the same size landed on that address, and the cache
+    /// happily kept serving the black frame - the picture stayed dark until
+    /// something else invalidated it.
+    #[test]
+    fn a_new_picture_at_the_old_address_is_not_the_old_picture() {
+        let mut bg = picture(0);
+        let before = art_id(&bg);
+        for p in bg.rgba.iter_mut().step_by(3) {
+            *p ^= 0xff;
+        }
+        assert_ne!(
+            art_id(&bg),
+            before,
+            "the same buffer holding a different picture kept its cache key"
+        );
+    }
+
+    /// The identity is stable for a picture that is not touched, or every frame
+    /// would recompose the scene.
+    #[test]
+    fn an_untouched_picture_keeps_its_id() {
+        let bg = picture(7);
+        assert_eq!(art_id(&bg), art_id(&bg));
+        let same_content = picture(7);
+        assert_ne!(art_id(&bg), art_id(&same_content), "two buffers are two pictures");
     }
 }
