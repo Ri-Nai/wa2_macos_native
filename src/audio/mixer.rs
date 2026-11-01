@@ -17,11 +17,24 @@ use std::thread;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: u16 = 2;
+
+/// `fcntl(2)` command and flag values, spelled out because this file talks to
+/// libc directly and they differ between the platforms the engine runs on.
+const F_GETFL: i32 = 3;
+const F_SETFL: i32 = 4;
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0x800;
+#[cfg(not(target_os = "linux"))]
+const O_NONBLOCK: i32 = 0x0004;
 /// Frames rendered per mix call. 1024 stereo frames is 21.33 ms at 48 kHz and
 /// matches the device buffer requested in `sdl_open_audio`.
 pub const BLOCK_FRAMES: usize = 1024;
 /// Bytes of interleaved s16le produced by one block.
 pub const BLOCK_BYTES: u32 = (BLOCK_FRAMES * CHANNELS as usize * 2) as u32;
+
+/// Samples a single stream may hold ahead of the mixer. 8192 s16 samples is
+/// 4096 stereo frames, about 85 ms - the same slack the device queue keeps.
+const PCM_TARGET: usize = 8192;
 
 /// Mixer categories. The option screen's four volume sliders map onto these:
 /// `all` scales everything, the others scale one kind of sound.
@@ -73,9 +86,20 @@ impl Stream {
         if looping { command.args(["-stream_loop", "-1"]); }
         let child = command.args(["-i", input, "-f", "s16le", "-ar", "48000", "-ac", "2", "-"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().ok()?;
-        // Linux O_NONBLOCK: no decoder may hold the mixer lock while waiting.
+        // No decoder may hold the mixer lock while waiting.
+        //
+        // The flag value is per-platform: Linux O_NONBLOCK is 0x800, macOS
+        // (and every BSD) is 0x0004. Using the Linux constant here meant
+        // F_SETFL silently set a bit the kernel ignores, the pipe stayed
+        // blocking, and one slow decoder stalled the whole mixer thread -
+        // including every other stream it was supposed to be feeding.
         let fd = child.stdout.as_ref()?.as_raw_fd();
-        unsafe { let flags = fcntl(fd, 3); if flags >= 0 { fcntl(fd, 4, flags | 0x800); } }
+        unsafe {
+            let flags = fcntl(fd, F_GETFL);
+            if flags >= 0 {
+                fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            }
+        }
         Some(Stream { label: input.to_string(), cat: CAT_ALL, carry: Vec::new(),
             child: Some(child), mem: None, mem_pos: 0,
             pcm: VecDeque::new(), volume: 1.0, looping, eos: false,
@@ -159,11 +183,11 @@ impl Mixer {
                     let mut g = inner2.lock().unwrap();
                     for s in g.streams.iter_mut() {
                         if let Some(st) = s {
-                            if st.eos || st.pcm.len() >= 8192 { continue; }
+                            if st.eos || st.pcm.len() >= PCM_TARGET { continue; }
                             // In-memory source: refill from the buffer, no pipe.
                             if let Some(src) = st.mem.clone() {
-                                while st.pcm.len() < 8192 && st.mem_pos < src.len() {
-                                    let n = (8192 - st.pcm.len()).min(src.len() - st.mem_pos);
+                                while st.pcm.len() < PCM_TARGET && st.mem_pos < src.len() {
+                                    let n = (PCM_TARGET - st.pcm.len()).min(src.len() - st.mem_pos);
                                     st.pcm.extend(src[st.mem_pos..st.mem_pos + n].iter().copied());
                                     st.mem_pos += n;
                                 }
@@ -177,30 +201,47 @@ impl Mixer {
                                 continue;
                             }
                             let mut buf = [0u8; 4096];
-                            if let Some(child) = st.child.as_mut() {
-                                if let Some(out) = child.stdout.as_mut() {
-                                    match out.read(&mut buf) {
-                                        Ok(0) => {
-                                            st.eos = true;
-                                            // Decoder exited on its own: reap it, or every
-                                            // finished SE/voice line stays a zombie.
-                                            if let Some(c) = st.child.as_mut() {
-                                                if matches!(c.try_wait(), Ok(Some(_))) {
-                                                    st.child = None;
-                                                }
+                            // Refill the stream's own queue rather than
+                            // reading one buffer per tick: at 2 ms per tick and
+                            // 21 ms of PCM per read, a stream whose queue had
+                            // run dry could not catch up while the device was
+                            // consuming it, and the output ran at a lower depth
+                            // than the target - audible as dropouts on macOS,
+                            // where an underrun makes the driver repeat the
+                            // last buffer instead of going silent.
+                            let mut taken = 0usize;
+                            loop {
+                                if st.pcm.len() >= PCM_TARGET || taken >= 32 * 1024 {
+                                    break;
+                                }
+                                let Some(child) = st.child.as_mut() else { break };
+                                let Some(out) = child.stdout.as_mut() else { break };
+                                match out.read(&mut buf) {
+                                    Ok(0) => {
+                                        st.eos = true;
+                                        // Decoder exited on its own: reap it, or every
+                                        // finished SE/voice line stays a zombie.
+                                        if let Some(c) = st.child.as_mut() {
+                                            if matches!(c.try_wait(), Ok(Some(_))) {
+                                                st.child = None;
                                             }
                                         }
-                                        Ok(n) => {
-                                            st.carry.extend_from_slice(&buf[..n]);
-                                            let usable = st.carry.len() - (st.carry.len() % 2);
-                                            for ch in st.carry[..usable].chunks_exact(2) {
-                                                st.pcm.push_back(i16::from_le_bytes([ch[0], ch[1]]));
-                                            }
-                                            PULLED.fetch_add((usable / 2) as u64, Ordering::Relaxed);
-                                            st.carry.drain(..usable);
+                                        break;
+                                    }
+                                    Ok(n) => {
+                                        taken += n;
+                                        st.carry.extend_from_slice(&buf[..n]);
+                                        let usable = st.carry.len() - (st.carry.len() % 2);
+                                        for ch in st.carry[..usable].chunks_exact(2) {
+                                            st.pcm.push_back(i16::from_le_bytes([ch[0], ch[1]]));
                                         }
-                                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                                        Err(_) => st.eos = true,
+                                        PULLED.fetch_add((usable / 2) as u64, Ordering::Relaxed);
+                                        st.carry.drain(..usable);
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => {
+                                        st.eos = true;
+                                        break;
                                     }
                                 }
                             }
