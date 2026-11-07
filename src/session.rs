@@ -155,6 +155,28 @@ pub(crate) fn upcoming_art(
                         pending = Some((cid as u32, (flag / 1000) as u32, variant as u32));
                     }
                 }
+                // A scroll CG whose payload sits in the preceding K30 record
+                // (`mode, cg_id, variant, frames, 0, 0, h, n`), picked up by
+                // the ACT227 that follows. The interpreter raises it in
+                // `finish_record`; the prefetch scanner must recognise the same
+                // shape or the tall picture is decoded synchronously on the
+                // main thread while the screen sits on the black cut before it.
+                if *k == 30 && !tok_hit && !act_hit && ints.len() >= 6 {
+                    let mode = ints[0];
+                    let cg = ints[1];
+                    if (0..=5).contains(&mode)
+                        && cg >= 1000
+                        && p.ops[i..]
+                            .iter()
+                            .take(16)
+                            .any(|o| matches!(o, Op::Act { id, .. } if *id == 227))
+                    {
+                        let n = event_cg_name(cg as i64, ints[2].max(0) as u32);
+                        if !bgs.contains(&n) {
+                            bgs.push(n);
+                        }
+                    }
+                }
                 ints.clear();
                 tok_hit = false;
                 act_hit = false;
@@ -205,6 +227,19 @@ pub(crate) fn upcoming_art(
                     201 => {
                         if ints.len() >= 3 && ints[0] > 0 && ints[2] != 0 {
                             let n = event_cg_name(ints[0] as i64, ints[1].max(0) as u32);
+                            if !bgs.contains(&n) {
+                                bgs.push(n);
+                            }
+                        }
+                    }
+                    227 => {
+                        // Scroll/effects CG. The inline form carries the
+                        // picture in its own record: `(mode, cg_id, variant,
+                        // frames, ...)` with `cg_id >= 1000`. These are several
+                        // screens tall and the slowest decode in the tree, so
+                        // they must be prefetched like every other CG.
+                        if ints.len() >= 4 && ints[1] >= 1000 {
+                            let n = event_cg_name(ints[1] as i64, ints[2].max(0) as u32);
                             if !bgs.contains(&n) {
                                 bgs.push(n);
                             }

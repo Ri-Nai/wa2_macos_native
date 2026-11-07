@@ -23,6 +23,10 @@ export WA2_DATA="$DATA"
 # pixel-exact and 4x would only be supersampled away.
 export WA2_ART_SCALE="${WA2_ART_SCALE:-4}"
 export WA2_RENDER_SCALE="${WA2_RENDER_SCALE:-auto}"
+# 超长 scroll CG（v200000 1280x3362、v201900 1280x2160）解码一次要 1~4 秒，
+# 默认的磁盘缓存上限 2x 会让它们每次冷启动都重新解码，屏幕停在黑幕上。
+# 把磁盘缓存上限提到 4x，让这类大图解码一次后就一直走缓存，消除黑屏。
+export WA2_ART_DISK_SCALE="${WA2_ART_DISK_SCALE:-4}"
 
 mode=play
 case "${1:-}" in
@@ -72,10 +76,29 @@ fi
 
 [ "$mode" = check ] && { echo "依赖与素材就绪：$DATA"; exit 0; }
 
+# 黑屏排查：把引擎的 stderr 日志（每帧 scene/bg 状态）同时落盘，
+# 这样从 Finder 双击 .app 或正常游玩时，黑屏那一瞬间的原因也会被记下来。
+LOG="${WA2_LOG:-$PWD/wa2.log}"
+if [ "${WA2_NOLOG:-0}" != "1" ]; then
+  : > "$LOG"
+  echo "引擎日志写入：$LOG（设 WA2_NOLOG=1 可关闭）" >&2
+fi
+
+run() {
+  if [ "${WA2_NOLOG:-0}" != "1" ]; then
+    "$BIN" "$@" 2>&1 | tee -a "$LOG"
+  else
+    "$BIN" "$@"
+  fi
+}
+
 if [ $# -eq 0 ] || [ "$1" = title ]; then
-  exec "$BIN" title
+  run title
+  exit $?
 fi
 if [[ "$1" =~ ^[0-9]+$ ]]; then
-  exec "$BIN" run "$1"
+  run run "$1"
+  exit $?
 fi
-exec "$BIN" "$@"
+run "$@"
+exit $?
