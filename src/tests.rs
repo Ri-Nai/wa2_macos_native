@@ -75,6 +75,58 @@ mod prefetch_scan_tests {
         assert_eq!(paths, vec![dir.join("f0033.bmp")]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn upcoming_art_prefetches_the_scroll_cg() {
+        // The inline ACT227 form: (mode, cg_id, variant, frames, ...) with
+        // cg_id >= 1000. The tall picture must be queued like every other CG,
+        // or it decodes synchronously while the screen sits on the black cut.
+        let program = Program {
+            ops: vec![
+                Op::Rec { off: 0, kind: 30 },
+                Op::Int { off: 8, v: 1 },
+                Op::Int { off: 20, v: 20000 },
+                Op::Int { off: 32, v: 0 },
+                Op::Int { off: 44, v: 60 },
+                Op::Act { off: 56, id: 227 },
+            ],
+            index: HashMap::new(),
+            labels: Vec::new(),
+            tokens: vec![],
+            entry: 0,
+        };
+        let index = BgIndex::build(&[]);
+        let (bgs, _) = upcoming_art(&program, &index, None);
+        assert!(bgs.iter().any(|n| n == "v200000.tga"), "scroll CG not queued: {bgs:?}");
+    }
+
+    #[test]
+    fn upcoming_art_prefetches_the_record_carried_scroll_cg() {
+        // The K30-carried form: (mode, cg_id, variant, frames, 0, 0, h, n)
+        // sits in the record before the ACT227. The interpreter raises it in
+        // finish_record; the scanner must recognise the same shape.
+        let program = Program {
+            ops: vec![
+                Op::Rec { off: 0, kind: 30 },
+                Op::Int { off: 8, v: 1 },
+                Op::Int { off: 20, v: 20190 },
+                Op::Int { off: 32, v: 0 },
+                Op::Int { off: 44, v: 60 },
+                Op::Int { off: 56, v: 0 },
+                Op::Int { off: 68, v: 0 },
+                Op::Int { off: 80, v: 720 },
+                Op::Int { off: 92, v: 2 },
+                Op::Act { off: 104, id: 227 },
+            ],
+            index: HashMap::new(),
+            labels: Vec::new(),
+            tokens: vec![],
+            entry: 0,
+        };
+        let index = BgIndex::build(&[]);
+        let (bgs, _) = upcoming_art(&program, &index, None);
+        assert!(bgs.iter().any(|n| n == "v201900.tga"), "scroll CG not queued: {bgs:?}");
+    }
 }
 
 #[cfg(test)]
@@ -794,5 +846,64 @@ mod bg_request_tests {
     fn a_real_id_wants_a_picture() {
         assert_eq!(bg_request(1007), BgRequest::Picture);
         assert_eq!(bg_request(1), BgRequest::Picture);
+    }
+}
+
+#[cfg(test)]
+mod surface_pos_tests {
+    use crate::sdl2::fit_surface_pos;
+
+    /// A 16:9 window is a 1:1 pass-through of the pointer.
+    #[test]
+    fn a_16_by_9_window_maps_the_pointer_directly() {
+        // Window 1280x720, surface 1280x720: no letterbox, identity map.
+        assert_eq!(fit_surface_pos(640, 360, 1280, 720, 1280, 720), (640, 360));
+        assert_eq!(fit_surface_pos(0, 0, 1280, 720, 1280, 720), (0, 0));
+        assert_eq!(fit_surface_pos(1279, 719, 1280, 720, 1280, 720), (1279, 719));
+    }
+
+    /// A Retina window reports the same *logical* size, so the pointer (also
+    /// reported in points) maps identically whether the backing store is 1x or
+    /// 2x — the DPI ratio never enters `fit_surface_pos`, only the logical
+    /// window size and the surface's layout size.
+    #[test]
+    fn a_retina_16_by_9_window_is_still_identity() {
+        assert_eq!(fit_surface_pos(640, 360, 1280, 720, 1280, 720), (640, 360));
+        assert_eq!(fit_surface_pos(0, 0, 1280, 720, 1280, 720), (0, 0));
+        assert_eq!(fit_surface_pos(1279, 719, 1280, 720, 1280, 720), (1279, 719));
+    }
+
+    /// A taller-than-16:9 window letterboxes vertically; a click must subtract
+    /// the top bar before scaling, or the choices land too low.
+    #[test]
+    fn a_16_by_10_window_removes_the_vertical_letterbox() {
+        // 1280x800 window holding a 1280x720 surface: the surface is fit to
+        // width, so scale = 1.0 and the picture occupies y in [40, 760].
+        // Clicking at y=40 (the top of the art) must map to surface y=0.
+        assert_eq!(fit_surface_pos(640, 40, 1280, 720, 1280, 800), (640, 0));
+        // The centre of the art (y=400) is the centre of the surface (360).
+        assert_eq!(fit_surface_pos(640, 400, 1280, 720, 1280, 800), (640, 360));
+        // The bottom of the art (y=760) is the bottom of the surface (719).
+        assert_eq!(fit_surface_pos(640, 760, 1280, 720, 1280, 800), (640, 719));
+    }
+
+    /// A wider-than-16:9 window letterboxes horizontally.
+    #[test]
+    fn an_ultrawide_window_removes_the_horizontal_letterbox() {
+        // 1600x720 window holding a 1280x720 surface: fit to height, scale=1.0,
+        // picture occupies x in [160, 1440]. Clicking x=160 maps to surface x=0.
+        assert_eq!(fit_surface_pos(160, 360, 1280, 720, 1600, 720), (0, 360));
+        assert_eq!(fit_surface_pos(800, 360, 1280, 720, 1600, 720), (640, 360));
+        assert_eq!(fit_surface_pos(1440, 360, 1280, 720, 1600, 720), (1279, 360));
+    }
+
+    /// A click out on the letterbox still clamps to the surface edge instead
+    /// of producing a coordinate outside [0, sw/sh).
+    #[test]
+    fn a_click_on_the_letterbox_clamps_to_the_edge() {
+        // Above the art: y < 40 in the 1280x800 example -> clamps to y=0.
+        assert_eq!(fit_surface_pos(640, 0, 1280, 720, 1280, 800), (640, 0));
+        // Below the art: y > 760 -> clamps to y=719.
+        assert_eq!(fit_surface_pos(640, 799, 1280, 720, 1280, 800), (640, 719));
     }
 }
