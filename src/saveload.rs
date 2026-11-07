@@ -4,13 +4,12 @@
 //! are pixel aligned with each other:
 //!
 //! ```text
-//!   sys_05000        top banner (1280x36)
+//!   sys_05200        top banner, "DATA PAGE" (1000x24)
 //!   sys_05900        one slot panel, 272x160, normal
 //!   sys_05901        the same panel lit (the slot under the cursor)
 //!   sys_05903        the empty slot (fully transparent)
 //!   sys_05100        gold frame drawn over the slot under the cursor
 //!   sys_05110        drop shadow, drawn under a panel
-//!   sys_05021        footer widget, 288x40
 //! ```
 //!
 //! The screen is a paged grid of twelve 272x160 cells, which is what fits on
@@ -45,8 +44,6 @@ const FRAME_H: i32 = 136;
 const THUMB_W: i32 = 242;
 const THUMB_H: i32 = FRAME_H;
 
-const FOOTER_X: i32 = (W as i32 - 288) / 2;
-const FOOTER_Y: i32 = H as i32 - 56;
 /// Caption strip over the bottom of the thumbnail.
 const CAP_H: i32 = 22;
 const HINT_W: i32 = 420;
@@ -64,7 +61,6 @@ struct Assets {
     panel_hi: Option<TgaImage>,
     frame: Option<TgaImage>,
     shadow: Option<TgaImage>,
-    footer: Option<TgaImage>,
 }
 
 fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
@@ -94,12 +90,15 @@ fn load(dirs: &[&Path], name: &str) -> Option<TgaImage> {
 impl Assets {
     fn load(dirs: &[&Path]) -> Assets {
         Assets {
-            header: load(dirs, "sys_05000.tga"),
+            // The save/load banner is "DATA PAGE" (`sys_05200`). `sys_05000`
+            // is the CG-mode banner ("CG Mode / CGモード") and `sys_05021`
+            // is the CG gallery's caption footer ("鉴赏事件CG / CG MODE"), so
+            // neither belongs on this screen.
+            header: load(dirs, "sys_05200.tga"),
             panel: load(dirs, "sys_05900.tga"),
             panel_hi: load(dirs, "sys_05901.tga"),
             frame: load(dirs, "sys_05100.tga"),
             shadow: load(dirs, "sys_05110.tga"),
-            footer: load(dirs, "sys_05021.tga"),
         }
     }
 }
@@ -339,7 +338,12 @@ fn compose(
     let ph = |v: i32| (v as f32 * sy).round().max(1.0) as u32;
     s.fill_rect(0, 0, s.width, s.height, [0, 0, 0, 190]);
     if let Some(h) = a.header.as_ref() {
-        s.blit_region_scaled(h, 0, 0, h.width, h.height, 0, 0, s.width, ph(36), 255);
+        // "DATA PAGE" banner, 1000x24 in layout space; keep its aspect instead
+        // of stretching it to the full width (the old full-width banner was the
+        // CG-mode strip, which is a different, taller art).
+        let hw = (1000.0 * sx).round().max(1.0) as u32;
+        let hh = (24.0 * sy).round().max(1.0) as u32;
+        s.blit_region_scaled(h, 0, 0, h.width, h.height, 0, 0, hw, hh, 255);
     }
     for i in 0..slots.len() {
         let (cx, cy) = cell_pos(i);
@@ -382,8 +386,5 @@ fn compose(
         s.fill_rect(px(x0 - 10), py(HINT_Y - 2), pw(HINT_W + 20), ph(CAP_H + 4), [0, 0, 0, 170]);
         let hh = rgba.len() as u32 / (*hw * 4).max(1);
         s.blit_rgba(rgba, *hw, hh, px(x0), py(HINT_Y));
-    }
-    if let Some(f) = a.footer.as_ref() {
-        s.blit_region_scaled(f, 0, 0, f.width, f.height, px(FOOTER_X), py(FOOTER_Y), pw(288), ph(40), 255);
     }
 }
