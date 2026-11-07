@@ -843,11 +843,22 @@ pub fn compose_scene_art(
     }
 
     // Standing character sprites (bottom-anchored), below the dialog box.
+    //
+    // Sprites and overlays live in the 1280x720 *layout* space, while the
+    // background above is scaled from its own decoded (possibly 4x/8x) pixel
+    // size. Scaling a sprite's width and height independently (w / LAYOUT_W vs
+    // h / LAYOUT_H) only matches when the window is exactly 16:9; the moment
+    // the window is any other shape - fullscreen on a 4:3 or ultrawide display,
+    // or a dragged edge - the character gets squashed or stretched while the
+    // background stays proportional. Uniform scaling keeps the portrait's
+    // aspect ratio and pins it to the same letterboxed area the background
+    // occupies.
+    let layout_scale = (w as f32 / LAYOUT_W as f32).min(h as f32 / LAYOUT_H as f32);
     for sp in sprites {
-        let dx = (sp.x as i64 * w as i64 / LAYOUT_W as i64) as i32;
-        let dy = (sp.y as i64 * h as i64 / LAYOUT_H as i64) as i32;
-        let dw = sp.logical_w.max(1) * w / LAYOUT_W;
-        let dh = sp.logical_h.max(1) * h / LAYOUT_H;
+        let dx = ox as i32 + (sp.x as f32 * layout_scale) as i32;
+        let dy = oy as i32 + (sp.y as f32 * layout_scale) as i32;
+        let dw = (sp.logical_w.max(1) as f32 * layout_scale).max(1.0) as u32;
+        let dh = (sp.logical_h.max(1) as f32 * layout_scale).max(1.0) as u32;
         s.blit_region_scaled(
             sp.img, 0, 0, sp.img.width, sp.img.height,
             dx, dy, dw.max(1), dh.max(1), sp.alpha,
@@ -857,11 +868,11 @@ pub fn compose_scene_art(
         let scale = (*art_scale).max(1);
         let logical_w = (img.width / scale).max(1);
         let logical_h = (img.height / scale).max(1);
-        let dx = (*x).max(0) as u32 * w / LAYOUT_W;
-        let dy = (*y).max(0) as u32 * h / LAYOUT_H;
-        let dw = logical_w * w / LAYOUT_W;
-        let dh = logical_h * h / LAYOUT_H;
-        s.blit_region_scaled(img, 0, 0, img.width, img.height, dx as i32, dy as i32, dw.max(1), dh.max(1), 255);
+        let dx = ox as i32 + ((*x).max(0) as f32 * layout_scale) as i32;
+        let dy = oy as i32 + ((*y).max(0) as f32 * layout_scale) as i32;
+        let dw = (logical_w as f32 * layout_scale).max(1.0) as u32;
+        let dh = (logical_h as f32 * layout_scale).max(1.0) as u32;
+        s.blit_region_scaled(img, 0, 0, img.width, img.height, dx, dy, dw.max(1), dh.max(1), 255);
     }
 
     // Colour filter (sepia / nega / ...) over the scene art.
@@ -1643,5 +1654,57 @@ mod tests {
         );
         let i = ((100 * composed.width + 100) * 4) as usize;
         assert_eq!(&composed.pixels[i..i + 3], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn a_standing_sprite_keeps_its_aspect_ratio_off_16_by_9() {
+        use super::{compose_scene_art, SpriteDraw};
+        use crate::codec::tga::TgaImage;
+        // A 2:1 white sprite (200 logical px wide, 100 tall), bottom-anchored
+        // and horizontally centred in the 1280-wide layout.
+        let sprite = TgaImage {
+            width: 200,
+            height: 100,
+            rgba: [250u8, 250, 250, 255].repeat(200 * 100),
+        };
+        let draws = [SpriteDraw {
+            img: &sprite,
+            logical_w: 200,
+            logical_h: 100,
+            x: 640 - 100,
+            y: LAYOUT_H as i32 - 100,
+            alpha: 255,
+        }];
+        let bg = TgaImage {
+            width: LAYOUT_W,
+            height: LAYOUT_H,
+            rgba: [0u8, 0, 0, 255].repeat((LAYOUT_W * LAYOUT_H) as usize),
+        };
+        // A 1:1 window is very much not 16:9, so independent w/h scaling would
+        // squash the sprite into a square. Uniform scaling must keep it 2:1.
+        let composed = compose_scene_art(
+            &bg, None, 720, 720, &draws, None, false, None, None, 255, 0, &[],
+        );
+        // Find the white bounding box.
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (u32::MAX, u32::MAX, 0u32, 0u32);
+        for y in 0..composed.height {
+            for x in 0..composed.width {
+                let i = ((y * composed.width + x) * 4) as usize;
+                if composed.pixels[i] > 200 {
+                    min_x = min_x.min(x);
+                    min_y = min_y.min(y);
+                    max_x = max_x.max(x);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        let w = (max_x - min_x + 1) as f32;
+        let h = (max_y - min_y + 1) as f32;
+        // The sprite keeps its 2:1 shape (tolerating nearest-neighbour rounding).
+        assert!(
+            (w / h - 2.0).abs() < 0.1,
+            "sprite aspect {}x{} ({:.2}) should stay 2:1 on a square window",
+            w, h, w / h
+        );
     }
 }

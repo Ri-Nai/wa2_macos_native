@@ -22,6 +22,11 @@ const RTLD_NOW: c_int = 2;
 const SDL_INIT_VIDEO: u32 = 0x0000_0020;
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_WINDOW_SHOWN: u32 = 0x0000_0004;
+/// Let the user resize the window by dragging its edge. On macOS this flag is
+/// also what turns the green traffic-light button into "enter native
+/// fullscreen" instead of "maximize", which is the one fullscreen affordance
+/// the OS itself provides.
+const SDL_WINDOW_RESIZABLE: u32 = 0x0000_0020;
 /// Borderless window the size of the desktop. Exclusive fullscreen (flag 1)
 /// asks the display to switch to 1280×720, which the compositor ignores, so
 /// the 「全屏」 setting never changed the window.
@@ -331,16 +336,18 @@ impl Sdl {
             SDL_WINDOWPOS_CENTERED,
             tw as c_int,
             th as c_int,
-            // Keep a normal title bar for close/minimise, but do not mark the
-            // window resizable. SDL/most window managers derive the maximize
-            // button from this flag; fullscreen is deliberately controlled by
-            // the in-game display-mode setting (or F11) instead.
+            // Keep a normal title bar for close/minimise. The window IS
+            // resizable: that is what lets the macOS green button enter
+            // native fullscreen, and lets the user drag the edge to any size.
+            // The in-game 「画面模式」 setting (or F11) still controls SDL's
+            // desktop-fullscreen, which is an independent path.
             //
             // ALLOW_HIGHDPI is only requested where the pixel-size query
             // exists (SDL >= 2.26), because without it `window_size` would
             // report points and the compositor would draw a half-resolution
             // frame that the window server then upscales.
             SDL_WINDOW_SHOWN
+                | SDL_WINDOW_RESIZABLE
                 | if cfg!(target_os = "macos") && f_get_window_size_pixels.is_some() {
                     SDL_WINDOW_ALLOW_HIGHDPI
                 } else {
@@ -747,17 +754,28 @@ impl Sdl {
 /// pointer never change. After the request we move that window ourselves.
 pub fn set_fullscreen(&self, on: bool) {
     let Some(f) = FULLSCREEN.get() else { return };
+    // `SDL_SetWindowFullscreen(DESKTOP)` already covers the display on any
+    // platform with a window manager (macOS, Windows, GNOME/KDE/…). The manual
+    // move/resize below only exists for X11 sessions without a WM, where SDL's
+    // own size updates but the real X window stays 1280×720. Detect that case
+    // instead of blindly re-issuing the size, because `SDL_GetDisplayBounds`
+    // returns *physical* pixels and feeding them back through
+    // `SDL_SetWindowSize` (which takes *logical* points) is what stretched the
+    // window to twice its size after a fullscreen round-trip on a Retina Mac.
+    let needs_manual_resize = !cfg!(target_os = "macos") && self.is_x11();
     if on {
         self.remember_windowed();
         let rc = unsafe { (f)(self.window, SDL_WINDOW_FULLSCREEN_DESKTOP) };
         if rc != 0 {
             eprintln!("sdl: set fullscreen failed");
         }
-        if let Some((x, y, w, h)) = self.display_bounds() {
-            self.set_bordered(false);
-            self.x11_move_resize(x, y, w as u32, h as u32);
-            self.sdl_set_pos(x, y);
-            self.sdl_set_size(w, h);
+        if needs_manual_resize {
+            if let Some((x, y, w, h)) = self.display_bounds() {
+                self.set_bordered(false);
+                self.x11_move_resize(x, y, w as u32, h as u32);
+                self.sdl_set_pos(x, y);
+                self.sdl_set_size(w, h);
+            }
         }
     } else {
         let rc = unsafe { (f)(self.window, 0) };
@@ -807,7 +825,11 @@ fn remember_windowed(&self) {
         return;
     }
     let (x, y) = self.window_pos();
-    let (w, h) = self.window_size();
+    // `logical_size`, not `window_size`: the latter reports *device pixels*
+    // (2x on Retina) and `SDL_SetWindowSize` below takes *logical points*, so
+    // remembering device pixels is what made the window jump to twice its size
+    // when leaving fullscreen.
+    let (w, h) = self.logical_size();
     *slot = Some((x, y, w, h));
 }
 
@@ -873,6 +895,26 @@ fn fn_ptr<T>(&self, name: &str) -> Option<T> {
     } else {
         Some(unsafe { std::mem::transmute_copy(&p) })
     }
+}
+
+/// The WM subsystem of the current window, or `None` when SDL cannot report
+/// it. X11 is 2; the value only matters to decide whether the manual
+/// move/resize shim (for WM-less X11) is needed.
+fn wm_subsystem(&self) -> Option<i32> {
+    let get_ver = self.fn_ptr::<unsafe extern "C" fn(*mut u8)>("SDL_GetVersion")?;
+    let get_info =
+        self.fn_ptr::<unsafe extern "C" fn(*mut c_void, *mut u8) -> i32>("SDL_GetWindowWMInfo")?;
+    let mut info = [0u8; 128];
+    unsafe { get_ver(info.as_mut_ptr()) };
+    if unsafe { get_info(self.window, info.as_mut_ptr()) } != 1 {
+        return None;
+    }
+    // subsystem sits after the 3-byte version, aligned to 4.
+    Some(i32::from_ne_bytes([info[4], info[5], info[6], info[7]]))
+}
+
+fn is_x11(&self) -> bool {
+    self.wm_subsystem() == Some(2)
 }
 
 /// SDL's window id on X11, then move that window. `SDL_GetWindowWMInfo` needs
@@ -955,15 +997,21 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
         (w.max(1), h.max(1))
     }
 
-    /// Map a pointer event's window coordinates onto the game surface
-    /// (`present` stretches the surface over the whole window, so this is a
-    /// plain linear scale).
+    /// Map a pointer event's window coordinates onto the game surface.
+    ///
+    /// `present` stretches the *surface* over the whole window, but the scene
+    /// art inside it is scaled to *fit* (uniform `min` scale, letterboxed and
+    /// centred by `compose_scene_art`). A plain `x * sw / ww` only matches when
+    /// the window is exactly 16:9; the moment it is any other shape (fullscreen
+    /// on a 16:10 panel, a dragged edge) the vertical letterbox throws every
+    /// click off, which is what made the branch choices impossible to select.
+    /// This mirrors the compositor's `min` fit so hit-testing lands where the
+    /// art actually is.
     pub fn surface_pos(&self, x: i32, y: i32, sw: u32, sh: u32) -> (i32, i32) {
         // Pointer coordinates are in logical window units, the surface is in
-        // device pixels; the ratio between them is the DPI scale, so dividing
-        // by the logical size keeps hit-testing correct on Retina displays.
+        // device pixels; the ratio between them is the DPI scale.
         let (ww, wh) = self.logical_size();
-        (x * sw as i32 / ww, y * sh as i32 / wh)
+        fit_surface_pos(x, y, sw, sh, ww, wh)
     }
 
     /// Read back the current renderer target as RGBA (for verification),
@@ -997,6 +1045,28 @@ fn x11_move_resize(&self, x: i32, y: i32, w: u32, h: u32) {
     pub fn delay(&self, ms: u32) {
         unsafe { (self.f_delay)(ms); }
     }
+}
+
+/// Map a pointer event's window coordinates onto a `sw` x `sh` surface that is
+/// *fit* (uniform `min` scale, letterboxed and centred) into a `ww` x `wh`
+/// window — the exact geometry `compose_scene_art` paints with. A plain linear
+/// `x * sw / ww` only matches a 16:9 window; any other shape (fullscreen on a
+/// 16:10 panel, a dragged edge) introduces a vertical or horizontal letterbox
+/// that would otherwise shift every click off the art. Pure so it can be unit
+/// tested without a live SDL window.
+pub(crate) fn fit_surface_pos(x: i32, y: i32, sw: u32, sh: u32, ww: i32, wh: i32) -> (i32, i32) {
+    let (ww, wh) = (ww.max(1) as f64, wh.max(1) as f64);
+    let (sw, sh) = (sw.max(1) as f64, sh.max(1) as f64);
+    let scale = (ww / sw).min(wh / sh);
+    let dw = sw * scale;
+    let dh = sh * scale;
+    let ox = (ww - dw) / 2.0;
+    let oy = (wh - dh) / 2.0;
+    let lx = ((x as f64 - ox) / scale).round() as i32;
+    let ly = ((y as f64 - oy) / scale).round() as i32;
+    // Clamp into the surface so a click on the letterbox still resolves to the
+    // nearest edge instead of a wildly negative/overflowing coordinate.
+    (lx.clamp(0, sw as i32 - 1), ly.clamp(0, sh as i32 - 1))
 }
 
 impl Drop for Sdl {
