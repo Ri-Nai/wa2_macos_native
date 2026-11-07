@@ -376,6 +376,14 @@ pub struct Interp<'a> {
     rec_var: Option<u32>,
     rec_fun: Option<u32>,
     condition_result: Option<bool>,
+    /// When a `Choice` event is presented, this holds the op index of the
+    /// `Fun{sub=0}` instruction that raised it. A save made while the choices
+    /// are on screen rewinds `pc` back here (and keeps `options`) so a load
+    /// re-presents the same choice instead of skipping past it: `next_event`
+    /// has already advanced `pc` past the option instruction by the time the
+    /// frontend shows the menu, so without this the reloaded save starts after
+    /// the choice with a stale/default `choice_result`.
+    choice_pc: Option<usize>,
 }
 
 /// Everything about an interpreter that has to survive a save/load round trip.
@@ -411,19 +419,28 @@ pub struct InterpState {
     pub rec_var: Option<u32>,
     pub rec_fun: Option<u32>,
     pub condition_result: Option<bool>,
+    pub choice_pc: Option<usize>,
 }
 
 impl<'a> Interp<'a> {
     pub fn snapshot(&self) -> InterpState {
+        // A save taken while a choice menu is on screen must rewind to the
+        // `Fun{sub=0}` that raised it and keep the option text, otherwise a
+        // load resumes *after* the choice with a stale/default answer and the
+        // player never sees the menu again.
+        let (pc, options) = match self.choice_pc {
+            Some(rewind_pc) => (rewind_pc, self.options.clone()),
+            None => (self.pc, self.options.clone()),
+        };
         InterpState {
-            pc: self.pc,
+            pc,
             tok: self.tok,
             ints: self.ints.clone(),
             flts: self.flts.clone(),
             speaker: self.speaker.clone(),
             pending_voice: self.pending_voice,
             voice_scenario: self.voice_scenario,
-            options: self.options.clone(),
+            options,
             choice_result: self.choice_result,
             pending_b: self.pending_b,
             last_kind: self.last_kind.clone(),
@@ -436,6 +453,7 @@ impl<'a> Interp<'a> {
             rec_var: self.rec_var,
             rec_fun: self.rec_fun,
             condition_result: self.condition_result,
+            choice_pc: None,
         }
     }
 
@@ -463,6 +481,7 @@ impl<'a> Interp<'a> {
         self.rec_var = s.rec_var;
         self.rec_fun = s.rec_fun;
         self.condition_result = s.condition_result;
+        self.choice_pc = s.choice_pc;
     }
 }
 
@@ -492,6 +511,7 @@ impl<'a> Interp<'a> {
             rec_var: None,
             rec_fun: None,
             condition_result: None,
+            choice_pc: None,
         }
     }
 
@@ -626,6 +646,9 @@ impl<'a> Interp<'a> {
                     // `2, 0` after the option records = present the choice and wait.
                     if sub == 0 {
                         if let Some(options) = self.take_options() {
+                            // Remember where this choice began so a save taken
+                            // while it is on screen can rewind here on load.
+                            self.choice_pc = Some(self.pc.saturating_sub(1));
                             return Event::Choice { options };
                         }
                     }
@@ -1023,9 +1046,13 @@ impl<'a> Interp<'a> {
     }
 
     /// Present the pending choice options and take the player's answer.
+    ///
+    /// The option text is *cloned*, not taken: a save made while the choice is
+    /// on screen must still be able to record the options so a later load can
+    /// re-present them. `set_choice_result` clears them once the player picks.
     pub fn take_options(&mut self) -> Option<Vec<String>> {
         if self.options.len() >= 2 {
-            Some(std::mem::take(&mut self.options))
+            Some(self.options.clone())
         } else {
             self.options.clear();
             None
@@ -1034,6 +1061,10 @@ impl<'a> Interp<'a> {
 
     pub fn set_choice_result(&mut self, r: u32) {
         self.choice_result = r.max(1);
+        // The choice has been answered: drop the pending re-entry point and the
+        // now-consumed option text so the next ACT208 block starts clean.
+        self.choice_pc = None;
+        self.options.clear();
     }
 }
 
@@ -1257,5 +1288,48 @@ mod global_vm_tests {
             }
             other => panic!("expected K16 BgScene, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn snapshot_while_a_choice_is_shown_rewinds_to_the_choice() {
+        // Two ACT208 records collect the option text, then Fun{sub=0}
+        // presents the choice and waits. `next_event` has already advanced pc
+        // past the Fun by the time it returns `Choice`, so a save taken on the
+        // menu must rewind pc back to the Fun and keep the option text, or the
+        // reload would resume *after* the choice with the default answer.
+        let mut p = program(vec![
+            Op::Rec { off: 0, kind: 30 },
+            Op::Tok { off: 8, n: 0 },
+            Op::Act { off: 16, id: 208 },
+            Op::Rec { off: 24, kind: 30 },
+            Op::Tok { off: 32, n: 1 },
+            Op::Act { off: 40, id: 208 },
+            Op::Rec { off: 48, kind: 30 },
+            Op::Fun { off: 56, sub: 0 },
+            Op::Rec { off: 64, kind: 0 },
+            Op::Return { off: 72 },
+        ]);
+        p.tokens = vec!["再去见她".into(), "不再见面".into()];
+        let mut g = globals(1);
+        let mut it = Interp::new(&p, &mut g);
+        match it.next_event() {
+            Event::Choice { options } => assert_eq!(options, vec!["再去见她", "不再见面"]),
+            other => panic!("expected Choice, got {other:?}"),
+        }
+        // The save snapshot rewinds pc to the Fun and preserves the options.
+        let snap = it.snapshot();
+        assert_eq!(snap.options, vec!["再去见她", "不再见面"]);
+        assert_eq!(snap.choice_pc, None, "rewind is already folded into pc");
+        // Reloading from that snapshot re-presents the same choice.
+        let mut restored = Interp::new(&p, &mut g);
+        restored.restore(snap);
+        match restored.next_event() {
+            Event::Choice { options } => assert_eq!(options, vec!["再去见她", "不再见面"]),
+            other => panic!("expected re-presented Choice after load, got {other:?}"),
+        }
+        // Answering clears the re-entry state so the next choice starts clean.
+        restored.set_choice_result(2);
+        assert_eq!(restored.choice_result, 2);
+        assert!(restored.options.is_empty());
     }
 }
