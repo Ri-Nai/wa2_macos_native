@@ -41,3 +41,7 @@ tools/__pycache__/
 
 # Local upscale-runner pid file (not part of the project).
 run_sprite.pid
+
+# Runtime diagnostics (the launcher tees stderr here) and local agent notes.
+/wa2.log
+/.workbuddy/
