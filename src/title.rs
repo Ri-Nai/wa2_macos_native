@@ -524,7 +524,10 @@ pub(crate) fn run_title(
                         bg_dirs,
                         saveload::Mode::Load,
                         None,
-                        None,
+                        // Dim the title screen behind the slots instead of a
+                        // flat black backdrop, matching how the in-game load
+                        // screen dims the scene it was opened from.
+                        Some(&frame),
                         mixer,
                         Some(&ui),
                     ) {

@@ -1216,7 +1216,11 @@ pub(crate) fn run_game_at(
                         scene_look(&settings, bg_cg),
                         vfont.as_mut(),
                     );
-                    let row_layout = choice_row_layout(opts.len(), base.height);
+                    // The row geometry is kept in the 720-line layout space so it
+                    // matches the hit-testing (`surface_pos` is also fed 1280x720)
+                    // and `bar.hit`'s fixed layout constants. `paint_choice_rows`
+                    // scales it onto the actual (possibly high-DPI) frame.
+                    let row_layout = choice_row_layout(opts.len(), H);
                     let ui_se = ui_se_path(&s.script_dir);
                     let mut hover: Option<usize> = None;
                     let mut bar_hover: Option<cmdbar::Cmd> = None;
@@ -1235,6 +1239,17 @@ pub(crate) fn run_game_at(
                         win.delay(300);
                         1u32
                     } else {
+                        // The choice screen's frame only changes when the hover,
+                        // the command-bar highlight, or a toggle moves. Between
+                        // those it is byte-for-byte the last presented frame, so
+                        // rebuilding it every 16 ms - cloning the whole (possibly
+                        // 2560x1440) scene and re-rasterising the option rows -
+                        // is what made moving the mouse across the options feel
+                        // laggy. Cache the last frame and its state signature and
+                        // only recompose when the signature actually changed.
+                        let mut cached_frame: Option<render::Surface> = None;
+                        let mut cached_sig: Option<(Option<usize>, Option<cmdbar::Cmd>, bool, bool, bool, bool)> =
+                            None;
                         loop {
                             if cmd_rewind || rewind_left > 0 {
                                 let announce = !cmd_rewind && rewind_left <= 1;
@@ -1344,31 +1359,39 @@ pub(crate) fn run_game_at(
                                     }
                                 }
                             }
-                            let mut frame = render::Surface {
-                                width: base.width,
-                                height: base.height,
-                                pixels: base.pixels.clone(),
-                            };
-                            paint_choice_rows(
-                                &mut frame,
-                                vfont.as_mut(),
-                                font,
-                                &opts,
-                                &row_layout,
-                                hover,
-                                msg_plate.as_ref(),
-                                msg_frame.as_ref(),
-                                look_alpha,
-                            );
-                            let active = cmdbar::Active {
-                                auto: cmd_auto,
-                                skip: cmd_skip,
-                                rewind: cmd_rewind,
-                                hide: user_hide,
-                            };
-                            let (fw, fh) = (frame.width as i32, frame.height as i32);
-                            bar.draw(&mut frame, bar_hover, active, cmd_idle(&settings), fw, fh);
-                            win.present(&frame);
+                            let sig = (hover, bar_hover, cmd_auto, cmd_skip, cmd_rewind, user_hide);
+                            let rebuild = cached_frame.is_none() || cached_sig != Some(sig);
+                            if rebuild {
+                                let mut frame = render::Surface {
+                                    width: base.width,
+                                    height: base.height,
+                                    pixels: base.pixels.clone(),
+                                };
+                                paint_choice_rows(
+                                    &mut frame,
+                                    vfont.as_mut(),
+                                    font,
+                                    &opts,
+                                    &row_layout,
+                                    hover,
+                                    msg_plate.as_ref(),
+                                    msg_frame.as_ref(),
+                                    look_alpha,
+                                );
+                                let active = cmdbar::Active {
+                                    auto: cmd_auto,
+                                    skip: cmd_skip,
+                                    rewind: cmd_rewind,
+                                    hide: user_hide,
+                                };
+                                let (fw, fh) = (frame.width as i32, frame.height as i32);
+                                bar.draw(&mut frame, bar_hover, active, cmd_idle(&settings), fw, fh);
+                                win.present(&frame);
+                                cached_frame = Some(frame);
+                                cached_sig = Some(sig);
+                            } else if let Some(f) = cached_frame.as_ref() {
+                                win.present(f);
+                            }
                             match win.poll_input() {
                                 sdl2::Input::Quit => return Ok(None),
                                 sdl2::Input::RightClick => {
@@ -1581,6 +1604,12 @@ pub(crate) fn run_game_at(
                                                                     vfont.as_mut(),
                                                                 );
                                                                 cur_surf = clone_surf(&base);
+                                                                // The scene underneath the
+                                                                // rows changed but none of
+                                                                // the state in the cached
+                                                                // signature did, so drop the
+                                                                // stale frame.
+                                                                cached_frame = None;
                                                             }
                                                         }
                                                     }

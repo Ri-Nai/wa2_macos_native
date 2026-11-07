@@ -93,22 +93,28 @@ pub(crate) fn paint_choice_rows(
     alpha: u8,
 ) {
     let w = frame.width;
+    let fh = frame.height;
     let x = render::WINDOW_X.max(0) as u32 * w / render::LAYOUT_W;
     let plate_w = plate
         .map(|p| p.width.max(1) * w / render::LAYOUT_W)
         .unwrap_or_else(|| w.saturating_sub(2 * x).max(1));
+    // The rows are in 720-line layout space; scale them onto the frame (which
+    // may be a high-DPI surface taller than 720).
+    let sy = |v: i32| v * fh as i32 / render::LAYOUT_H as i32;
     for (i, row) in rows.iter().enumerate() {
-        let height = row.height.max(1) as u32;
+        let top = sy(row.top);
+        let height = sy(row.top + row.height) - top;
+        let height = height.max(1) as u32;
         if let Some(pl) = plate {
             frame.blit_region_scaled(
-                pl, 0, 0, pl.width, pl.height, x as i32, row.top, plate_w, height, alpha,
+                pl, 0, 0, pl.width, pl.height, x as i32, top, plate_w, height, alpha,
             );
         } else {
-            frame.fill_rect(x as i32, row.top, plate_w, height, [16, 62, 84, 220]);
+            frame.fill_rect(x as i32, top, plate_w, height, [16, 62, 84, 220]);
         }
         if let Some(fr) = frame_img {
             frame.blit_region_scaled(
-                fr, 0, 0, fr.width, fr.height, x as i32, row.top, plate_w, height, alpha,
+                fr, 0, 0, fr.width, fr.height, x as i32, top, plate_w, height, alpha,
             );
         }
         if hover == Some(i) {
@@ -117,14 +123,14 @@ pub(crate) fn paint_choice_rows(
             // over it.
             if let Some(pl) = plate {
                 frame.blit_region_scaled(
-                    pl, 0, 0, pl.width, pl.height, x as i32, row.top, plate_w, height, 96,
+                    pl, 0, 0, pl.width, pl.height, x as i32, top, plate_w, height, 96,
                 );
             } else {
-                frame.fill_rect(x as i32, row.top, plate_w, height, [120, 190, 220, 40]);
+                frame.fill_rect(x as i32, top, plate_w, height, [120, 190, 220, 40]);
             }
             if let Some(fr) = frame_img {
                 frame.blit_region_scaled(
-                    fr, 0, 0, fr.width, fr.height, x as i32, row.top, plate_w, height, 96,
+                    fr, 0, 0, fr.width, fr.height, x as i32, top, plate_w, height, 96,
                 );
             }
         }
@@ -146,7 +152,9 @@ pub(crate) fn paint_choice_rows(
             for (i, (opt, row)) in opts.iter().zip(rows).enumerate() {
                 let width = vf.measure(opt);
                 let tx = ((w as i32 - width) / 2).max(x as i32 + 8);
-                let baseline = vf.baseline_in_box(row.top, row.height);
+                let top = sy(row.top);
+                let height = sy(row.top + row.height) - top;
+                let baseline = vf.baseline_in_box(top, height.max(1));
                 let style = if hover == Some(i) { &hover_style } else { &body_style };
                 vf.draw_styled(frame, opt, tx, baseline, style);
             }
@@ -161,7 +169,9 @@ pub(crate) fn paint_choice_rows(
                     adv += if (ch as u32) < 128 { pitch / 2 } else { pitch };
                 }
                 let tx = ((w as i32 - adv) / 2).max(x as i32 + 8);
-                let ty = row.top + (row.height - font.cell() as i32) / 2;
+                let top = sy(row.top);
+                let height = sy(row.top + row.height) - top;
+                let ty = top + (height.max(1) - font.cell() as i32) / 2;
                 font.draw_pitch(frame, opt, tx, ty, pitch);
             }
         }

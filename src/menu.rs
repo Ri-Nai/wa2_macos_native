@@ -880,22 +880,40 @@ impl Assets {
         );
         let dirs: &[&Path] = &ordered;
         let cache = clean_dir();
-        let clean = [
-            read_clean(&cache, 0),
-            read_clean(&cache, 1),
-            read_clean(&cache, 2),
+        let base = [
+            load(dirs, "sys_03100.tga"),
+            load(dirs, "sys_03101.tga"),
+            load(dirs, "sys_03102.tga"),
         ];
-        let hover = [
-            read_hover(&cache, 0),
-            read_hover(&cache, 1),
-            read_hover(&cache, 2),
+        let cyan = [
+            load(dirs, "sys_03201.tga"),
+            load(dirs, "sys_03211.tga"),
+            load(dirs, "sys_03221.tga"),
         ];
+        // The caption wipe is a full-image pixel classifier and it costs several
+        // milliseconds every time it runs. The baked cache in `cache/ui/menu`
+        // is normally built ahead of time by `menu-clean`, but a data tree that
+        // never ran it would otherwise re-wipe the page on *every* hover change
+        // (the frame key includes the hovered row), which is what made moving
+        // between options feel laggy. Bake the clean page in memory here when
+        // the on-disk cache is absent, so the wipe runs exactly once per page
+        // per session and the option screen only ever blits the finished art.
+        let clean: [Option<TgaImage>; 3] = std::array::from_fn(|page| {
+            read_clean(&cache, page).or_else(|| {
+                base[page]
+                    .as_ref()
+                    .map(|b| surface_as_tga(&bake_clean_page(b, page)))
+            })
+        });
+        let hover: [Option<TgaImage>; 3] = std::array::from_fn(|page| {
+            read_hover(&cache, page).or_else(|| {
+                let state = cyan[page].as_ref()?;
+                let clean_surf = clean[page].as_ref().map(surface_from_tga_surf)?;
+                Some(surface_as_tga(&bake_clean_state(state, &clean_surf, page)))
+            })
+        });
         Assets {
-            base: [
-                load(dirs, "sys_03100.tga"),
-                load(dirs, "sys_03101.tga"),
-                load(dirs, "sys_03102.tga"),
-            ],
+            base,
             clean,
             hover,
             gold: [
@@ -903,11 +921,7 @@ impl Assets {
                 load(dirs, "sys_03210.tga"),
                 load(dirs, "sys_03220.tga"),
             ],
-            cyan: [
-                load(dirs, "sys_03201.tga"),
-                load(dirs, "sys_03211.tga"),
-                load(dirs, "sys_03221.tga"),
-            ],
+            cyan,
             header: load(dirs, "sys_03000.tga"),
             tabs: load(dirs, "sys_03011.tga"),
             nav: load(dirs, "sys_03020.tga"),
@@ -1535,6 +1549,17 @@ fn dim_caption(p: [u8; 3]) -> bool {
 fn clean_dir() -> std::path::PathBuf {
     let root = std::env::var("WA2_DATA").unwrap_or_else(|_| "data".to_string());
     std::path::Path::new(&root).join("cache/ui/menu")
+}
+
+/// Wrap a composited surface back into the image type the asset store holds.
+/// `Surface` and `TgaImage` are byte-identical (RGBA rows), so this is a move.
+fn surface_as_tga(s: &Surface) -> TgaImage {
+    TgaImage { width: s.width, height: s.height, rgba: s.pixels.clone() }
+}
+
+/// Borrow a `TgaImage` as a `Surface` for the bake helpers without copying.
+fn surface_from_tga_surf(img: &TgaImage) -> Surface {
+    Surface { width: img.width, height: img.height, pixels: img.rgba.clone() }
 }
 
 fn read_clean(dir: &Path, page: usize) -> Option<TgaImage> {
@@ -3702,7 +3727,18 @@ pub fn run(
     // The sheets above are laid out in the 1280x720 design space, so the
     // backdrop is brought to that size once and blitted under them every
     // frame; the finished frame is scaled back up to the window at the end.
-    let underlay: Option<Surface> = backdrop.map(|b| b.scaled_to(W, H));
+    //
+    // The page sheets are ~60% opaque dark glass, so what they let through is
+    // the picture the option screen opened over. The original dims that
+    // picture first: opening the options over the title screen (with its big
+    // "WHITE ALBUM 2" wordmark and menu labels) otherwise bleeds bright text
+    // straight through the glass and fights the captions. Darkening it keeps
+    // the glass legible while preserving the "see the scene behind" effect.
+    let underlay: Option<Surface> = backdrop.map(|b| {
+        let mut u = b.scaled_to(W, H);
+        u.dim(96);
+        u
+    });
     if !assets.available() {
         eprintln!("menu: option screen artwork missing, cannot open");
         return;
